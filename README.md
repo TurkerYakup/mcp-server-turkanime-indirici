@@ -29,6 +29,28 @@ Amaterasu   Alucard   PixelDrain   VK  MP4upload
 Vidmoly   Dailymotion   Yandisk   Uqload   Drive
 ```
 
+---
+
+## 🧩 MCP Sunucusu (bu fork'un eklentisi)
+
+Bu fork, `turkanime-cli` paketini saran **stdio tabanlı bir MCP sunucusu** ekler.
+Claude Desktop'a bağlandığında "şu animenin şu bölümlerini indir" dediğinizde Claude
+arka planda arar, indirir ve düzenli klasörler. Kod ve ayrıntılı kurulum:
+**[`turkanime-mcp/`](turkanime-mcp/) → [README](turkanime-mcp/README.md)**.
+
+**Araçlar:** `search_anime`, `list_episodes`, `download_episodes`,
+`download_season` (tüm sezonu asenkron indir), `download_status`.
+
+**Öne çıkanlar:**
+- Kullanıcıya özel indirme kök klasörü (config'de `TURKANIME_OUTPUT_DIR`).
+- Her anime için otomatik alt klasör: `<kök>/<Anime Başlığı>/<Anime Başlığı> - NNN.ext`.
+- Arka planda paralel indirme (`ThreadPoolExecutor`) + `download_status` ile takip.
+- Windows'ta ASCII-dışı kullanıcı yolu kaynaklı `curl_cffi` SSL sorununu otomatik çözer.
+
+> Not: MCP sunucusu yalnızca mevcut `turkanime_api` kütüphanesini sarar; kişisel
+> kullanım içindir. Selenium/webdriver gerektirmez.
+
+---
 
 ## Kurulum
 - İsterseniz Önceden derlenmiş EXE sürümü [indirme sayfasından](https://github.com/KebabLord/turkanime-indirici/releases/latest) indirip kullanmaya başlayabilirsiniz.

@@ -1,2 +1,13 @@
 geckodriver.log
 log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# MCP sunucusu — yerele özel / üretilen
+cacert.pem
+.claude/

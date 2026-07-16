@@ -1,0 +1,11 @@
+# TürkAnime İndirici MCP Sunucusu bağımlılıkları
+# Python 3.10+
+
+# Resmi Python MCP SDK
+mcp>=1.2.0
+
+# TürkAnime API + indirme motoru (yt-dlp, curl-cffi, pycryptodome dahil gelir)
+turkanime-cli>=10.0.4
+
+# Windows: mcp'nin stdio katmanı pywintypes'a ihtiyaç duyar (pywin32 ile gelir)
+pywin32>=306 ; sys_platform == "win32"
