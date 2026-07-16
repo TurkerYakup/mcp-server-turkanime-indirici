@@ -29,7 +29,9 @@ olarak açar. Kullanıcı sohbette isteğini yazar, Claude uygun aracı çağır
 
 - ⚙️ **Selenium/webdriver gerektirmez** — Cloudflare bypass `curl_cffi` (Firefox TLS impersonation) ile.
 - 🎞️ İndirme motoru **yt-dlp**; şifreli video URL'leri `pycryptodome` ile çözülür.
-- 🧵 İndirmeler **arka planda, paralel** (thread havuzu) sürer; MCP ana thread'i kilitlenmez.
+- 🧵 İndirmeler **arka planda** sürer; kaç bölümün **paralel** ineceğini seçebilirsin (`max_workers`, varsayılan tek tek).
+- 🔁 **Güvenilir tamamlanma:** yarıda kesilen indirme "bitti" sanılmaz — diske bakılıp doğrulanır ve
+  otomatik olarak **farklı bir kaynak** denenir. Kararsız **BETA** kaynakları (ör. `ALUCARD(BETA)`) en sona atılır.
 - 🗂️ Her anime için **otomatik düzenli klasör** oluşturur.
 - 🪟 **Windows** için tasarlandı; ASCII-dışı kullanıcı adlarındaki SSL sorununu otomatik çözer.
 
@@ -42,8 +44,8 @@ olarak açar. Kullanıcı sohbette isteğini yazar, Claude uygun aracı çağır
 | `search_anime(query)` | Anime arar | `[{slug, title}]` |
 | `list_episodes(anime_slug, refresh?)` | Bölümleri + özeti listeler (`refresh` yeni bölümler için) | `{title, ozet, episodes:[{index, slug, title}]}` |
 | `list_fansubs(anime_slug, episode?)` | Bölümün mevcut fansub gruplarını listeler | `{anime, bolum, fansubs:[…]}` |
-| `download_episodes(anime_slug, episodes, …)` | Seçili bölümleri **arka planda** indirir | `{job_ids, target_dir, …}` |
-| `download_season(anime_slug, …)` | **Tüm sezonu** asenkron indirir | `{job_ids, target_dir, …}` |
+| `download_episodes(anime_slug, episodes, …, max_workers?)` | Seçili bölümleri **arka planda** indirir (`max_workers` ile paralel sayısı) | `{job_ids, target_dir, parallel, …}` |
+| `download_season(anime_slug, …, max_workers?)` | **Tüm sezonu** asenkron indirir (`max_workers` ile paralel sayısı) | `{job_ids, target_dir, parallel, …}` |
 | `download_status(job_id?)` | İndirme durumunu sorgular | `[{status, percent, speed, eta, file, …}]` |
 | `cancel_download(job_id)` | Bir indirmeyi iptal eder (yarım dosyaları temizler) | `{job_id, status, message}` |
 | `cancel_all()` | Devam eden/kuyruktaki tüm indirmeleri iptal eder | `{cancelling, job_ids}` |
@@ -78,8 +80,9 @@ olarak açar. Kullanıcı sohbette isteğini yazar, Claude uygun aracı çağır
 
 - Alt klasör adını `subfolder` parametresiyle elle de verebilirsin.
 - `rename=False` verilirse ham düzen kalır: `<kök>/<anime_slug>/<bolum_slug>.ext`.
-- **Tüm sezon** indirmede bütün bölümler aynı anda kuyruğa girer; `TURKANIME_MAX_WORKERS`
-  kadarı paralel iner, gerisi sırada bekler.
+- **Tüm sezon** indirmede bütün bölümler kuyruğa girer; aynı anda kaç tanesinin ineceğini
+  `max_workers` belirler (verilmezse varsayılan **1 = tek tek**; `TURKANIME_MAX_WORKERS` ile
+  varsayılanı değiştirebilirsin). Gerisi sırada bekler.
 
 ---
 
@@ -148,7 +151,9 @@ Kaydedip Claude Desktop'ı **tamamen kapatıp yeniden açın** (tepsiden Quit). 
 | Değişken | Varsayılan | Açıklama |
 |----------|-----------|----------|
 | `TURKANIME_OUTPUT_DIR` | *(yok)* | Varsayılan indirme kök klasörü (kullanıcıya özel) |
-| `TURKANIME_MAX_WORKERS` | `3` | Eşzamanlı indirme (thread havuzu) sayısı |
+| `TURKANIME_MAX_WORKERS` | `1` | Eşzamanlı indirme **varsayılanı** (tool'da `max_workers` verilmezse bu kullanılır) |
+| `TURKANIME_SOURCE_ATTEMPTS` | `3` | Bir bölüm için denenecek farklı kaynak (player) sayısı; `1` = sadece ilk kaynak, retry yok |
+| `TURKANIME_WORKER_POOL` | `8` | Thread havuzu üst sınırı (`max_workers` bunu aşamaz) |
 | `CURL_CA_BUNDLE` | *(otomatik)* | ASCII CA sertifika yolu (sunucu gerekirse kendi ayarlar) |
 
 ---
@@ -163,8 +168,14 @@ Sunucu bunu **otomatik** çözer: sertifikayı `%PROGRAMDATA%\turkanime-mcp\cace
 `CURL_CA_BUNDLE`'a işaret eder. Yine de sorun olursa config'e elle ekleyin:
 `"env": { "CURL_CA_BUNDLE": "C:\\ProgramData\\turkanime-mcp\\cacert.pem" }`
 
-**`best_video` kaynak bulamıyor** → Bölümün ilgili işi `error` ("çalışan kaynak bulunamadı") olur;
-başka bölüm/fansub deneyin. Site HTML/regex değişirse `pip install -U turkanime-cli` ile güncelleyin.
+**Kaynak bulunamıyor / indirme tamamlanmıyor** → Bir kaynak akışı yarıda keserse iş **otomatik
+olarak sıradaki kaynağı** dener (`TURKANIME_SOURCE_ATTEMPTS` kadar). Hepsi başarısız olursa iş
+`error` olur ve denenen kaynaklar mesajda listelenir. Site HTML/regex değişirse
+`pip install -U turkanime-cli` ile güncelleyin.
+
+**İndirme çok yavaş** → Kaynaklar stream başına hız sınırlayabilir (~200 KiB/s). İnternetin
+destekliyorsa `max_workers`'ı artırarak (ör. `3`–`6`) toplam hızı yükseltebilirsin; ya da
+`max_resolution=false` ile daha küçük/daha hızlı (SD) dosya indirebilirsin.
 
 **Log nerede?** Sunucu tüm log'ları **stderr**'e yazar (stdout MCP protokolüne ait). Claude Desktop:
 `%APPDATA%\Claude\logs\mcp-server-turkanime.log`.
@@ -178,13 +189,18 @@ Claude Desktop  ──stdio──▶  turkanime_mcp.py (FastMCP)
                                │
                                ├─ search_anime  ─▶ turkanime_api.Anime.arama_yap
                                ├─ list_episodes ─▶ Anime.fetch_info + bolumler
-                               └─ download_*    ─▶ ThreadPoolExecutor
-                                                    └─ Bolum.best_video ─▶ Video.indir (yt-dlp)
+                               └─ download_*    ─▶ ThreadPoolExecutor + paralel kapı (max_workers)
+                                                    └─ kaynak seç (BETA'lar sona) ─▶ Video.indir (yt-dlp)
+                                                         ├─ tamamlanma diskten doğrulanır
+                                                         ├─ eksikse → farklı kaynakla retry
                                                          └─ finalize: düzenli klasöre taşı + adlandır
 ```
 
 - İş durumu paylaşımlı bir `JOBS` sözlüğünde tutulur; `download_status` bunu okur.
 - `Anime` nesneleri slug bazında önbelleğe alınır (tekrar `fetch_info` maliyetini önler).
+- Eşzamanlılık **dinamik bir kapı** ile sınırlanır; her indirme çağrısı kendi `max_workers`'ını seçer.
+- Kaynak seçiminde kararsız **BETA** player'lar en sona atılır; yt-dlp `ignoreerrors` yüzünden
+  yarıda kesilen indirmeyi "bitti" sanmamak için tamamlanma **dosya sisteminden** doğrulanır.
 
 ---
 

@@ -118,8 +118,56 @@ def _get_ta():
 # --------------------------------------------------------------------------- #
 # Global durum: iş havuzu, iş sözlüğü, anime önbelleği
 # --------------------------------------------------------------------------- #
-_MAX_WORKERS = int(os.environ.get("TURKANIME_MAX_WORKERS", "3"))
-_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="ta-dl")
+# İş havuzu boyutu (thread üst sınırı). Gerçek eşzamanlılık aşağıdaki dinamik
+# kapı ile sınırlanır; her indirme çağrısı kendi paralel sayısını seçebilir.
+_WORKER_POOL_SIZE = max(1, int(os.environ.get("TURKANIME_WORKER_POOL", "8")))
+_EXECUTOR = ThreadPoolExecutor(max_workers=_WORKER_POOL_SIZE, thread_name_prefix="ta-dl")
+
+# Eşzamanlı indirme VARSAYILANI: tool çağrısında `max_workers` verilmezse bu
+# kullanılır. Varsayılan 1 = tek tek indir. Config'de TURKANIME_MAX_WORKERS ile
+# değiştirilebilir (örn. "3").
+_DEFAULT_PARALLEL = max(1, int(os.environ.get("TURKANIME_MAX_WORKERS", "1")))
+
+# Dinamik eşzamanlılık kapısı: _parallel_limit çalışırken değişebilir; her
+# indirme çağrısı bunu kendi max_workers'ına ayarlar. İndirme işleri slot alır.
+_PARALLEL_COND = threading.Condition()
+_parallel_limit = _DEFAULT_PARALLEL
+_parallel_active = 0
+
+
+def _set_parallel_limit(n: Optional[int]) -> int:
+    """Eşzamanlı indirme sınırını ayarlar (1.._WORKER_POOL_SIZE). None → varsayılan."""
+    global _parallel_limit
+    target = _DEFAULT_PARALLEL if n is None else int(n)
+    target = max(1, min(target, _WORKER_POOL_SIZE))
+    with _PARALLEL_COND:
+        _parallel_limit = target
+        _PARALLEL_COND.notify_all()
+    return target
+
+
+def _acquire_slot(jid: str) -> bool:
+    """Dinamik limite göre indirme slotu al; limit doluysa bekler.
+
+    İptal edilirse slot almadan False döner (iş 'cancelled' işaretlenmeli).
+    """
+    global _parallel_active
+    with _PARALLEL_COND:
+        while _parallel_active >= _parallel_limit:
+            if _is_cancelled(jid):
+                return False
+            _PARALLEL_COND.wait(timeout=0.5)
+        _parallel_active += 1
+        return True
+
+
+def _release_slot() -> None:
+    """İndirme slotunu bırak ve bekleyenleri uyandır."""
+    global _parallel_active
+    with _PARALLEL_COND:
+        if _parallel_active > 0:
+            _parallel_active -= 1
+        _PARALLEL_COND.notify_all()
 
 # Varsayılan indirme klasörü — kullanıcıya özeldir, Claude Desktop config'inde
 # env -> TURKANIME_OUTPUT_DIR ile ayarlanır. Böylece kullanıcı "masaüstü/anime"
@@ -129,6 +177,12 @@ _DEFAULT_OUTPUT_DIR = os.environ.get("TURKANIME_OUTPUT_DIR", "").strip()
 
 # "Tüm bölümler" için kabul edilen anahtar sözcükler
 _ALL_TOKENS = {"all", "hepsi", "tümü", "tumu", "tum", "*", "sezon", "season"}
+
+# Bir bölüm için denenecek maksimum farklı kaynak (player) sayısı. İlk kaynağın
+# akışı yarıda keserse (imzalı URL süresi dolması, CDN bağlantı kesmesi vb.),
+# başarısız player hariç tutulup farklı bir kaynakla yeniden denenir. Her
+# başarısız deneme bant genişliği harcadığından makul bir üst sınır tutulur.
+_MAX_SOURCE_ATTEMPTS = max(1, int(os.environ.get("TURKANIME_SOURCE_ATTEMPTS", "3")))
 
 # job_id -> iş bilgisi dict'i
 JOBS: dict[str, dict[str, Any]] = {}
@@ -363,6 +417,87 @@ def _cleanup_partials(output_base: str, anime_slug: str, bolum: Any) -> None:
         pass
 
 
+_SUPPORTED_CACHE: Optional[list] = None
+
+
+def _supported_players() -> list:
+    """turkanime_api'nin desteklenen player öncelik listesi (tembel yüklenir)."""
+    global _SUPPORTED_CACHE
+    if _SUPPORTED_CACHE is None:
+        try:
+            from turkanime_api.objects import SUPPORTED
+            _SUPPORTED_CACHE = list(SUPPORTED)
+        except Exception:  # pragma: no cover
+            _SUPPORTED_CACHE = []
+    return _SUPPORTED_CACHE
+
+
+def _download_complete(output_base: str, anime_slug: str, bolum: Any) -> bool:
+    """İndirme GERÇEKTEN tamamlandı mı diye diske bakar.
+
+    Neden gerekli: upstream `indir()` yt-dlp'yi `ignoreerrors='only_download'`
+    ile çağırır; indirme ortada kesilse bile hatasız döner. Bu yüzden akışın
+    dönmesine güvenemeyiz — tamamlanma = bölüm slug'ıyla başlayan bir SON dosya
+    var VE ortada `.part`/`.ytdl` (yarım) dosya YOK.
+    """
+    folder = os.path.join(output_base, anime_slug)
+    if not os.path.isdir(folder):
+        return False
+    prefix = getattr(bolum, "slug", "") or ""
+    has_final = False
+    for name in os.listdir(folder):
+        if prefix and not name.startswith(prefix):
+            continue
+        if name.endswith(".part") or name.endswith(".ytdl") or ".part-" in name:
+            return False  # yarım dosya var → tamamlanmamış
+        has_final = True
+    return has_final
+
+
+def _pick_video(bolum: Any, by_res: bool, by_fansub: Optional[str],
+                exclude_players: set, callback) -> Any:
+    """`best_video` benzeri kaynak seçimi; ama `exclude_players` içindeki
+    player'ları atlar. Böylece yarıda kesen bir kaynağı retry'da eleyebiliriz.
+
+    best_video her fansub için `SUPPORTED.index(player)`e göre sıraladığından
+    hep aynı "en iyi" player'ı seçer; bu fonksiyon başarısız player'ı dışlayarak
+    gerçek bir alternatif dener. Uygun video yoksa None döner.
+    """
+    supported = _supported_players()
+
+    def _prio(v: Any):
+        # BETA player'lar (ör. ALUCARD(BETA)) ~%70'te akışı kesme eğiliminde;
+        # kararlı kaynaklar önce denensin, BETA yalnızca başka seçenek yoksa.
+        is_beta = "(BETA)" in (v.player or "").upper()
+        try:
+            idx = supported.index(v.player)
+        except ValueError:
+            idx = len(supported)
+        return (is_beta, bool(by_fansub) and v.fansub != by_fansub, idx)
+
+    vids = [v for v in bolum.videos
+            if getattr(v, "is_supported", False) and v.player not in exclude_players]
+    vids = sorted(vids, key=_prio)
+
+    working: list = []
+    total = len(vids)
+    for i, vid in enumerate(vids, start=1):
+        callback({"current": i, "total": total, "player": vid.player,
+                  "status": "üstbilgi çekiliyor"})
+        try:
+            if not vid.is_working:
+                continue
+        except Exception:
+            continue
+        working.append(vid)
+        res = vid.resolution or 600
+        if not by_res or res >= 1080:
+            return vid
+    if not working:
+        return None
+    return max(working, key=lambda x: x.resolution or 600)
+
+
 def _download_task(
     jid: str,
     anime_slug: str,
@@ -376,6 +511,7 @@ def _download_task(
     rename: bool,
 ) -> None:
     """Tek bir bölümü indiren arka plan işi (thread havuzunda çalışır)."""
+    slot_held = False
     try:
         # Kuyrukta beklerken iptal edildiyse hiç başlama.
         if _is_cancelled(jid):
@@ -383,10 +519,17 @@ def _download_task(
             log.info("[%s] başlamadan iptal edildi: %s", jid, bolum.slug)
             return
 
-        _job_set(jid, status="kaynak_araniyor")
+        # Eşzamanlılık kapısı: dinamik paralel limite göre sıraya gir.
+        # (Slot alınana kadar status "queued" kalır.)
+        if not _acquire_slot(jid):
+            _job_set(jid, status="cancelled")
+            _cleanup_partials(output_base, anime_slug, bolum)
+            log.info("[%s] slot beklerken iptal edildi: %s", jid, bolum.slug)
+            return
+        slot_held = True
 
         def bv_callback(d: dict) -> None:
-            # best_video ilerleme/durum bildirimi
+            # kaynak seçme ilerleme/durum bildirimi
             _job_set(
                 jid,
                 source_status=d.get("status"),
@@ -394,22 +537,6 @@ def _download_task(
                 source_total=d.get("total"),
                 player=d.get("player"),
             )
-
-        video = bolum.best_video(
-            by_res=max_resolution,
-            by_fansub=fansub,
-            callback=bv_callback,
-        )
-        if video is None:
-            _job_set(jid, status="error", error="Bu bölüm için çalışan kaynak bulunamadı.")
-            log.info("[%s] çalışan kaynak yok: %s", jid, bolum.slug)
-            return
-
-        _job_set(
-            jid,
-            player=getattr(video, "player", None),
-            fansub=getattr(video, "fansub", None),
-        )
 
         def hook(d: dict) -> None:
             # İptal istendiyse hook'tan exception fırlat → yt-dlp indirmeyi durdurur.
@@ -425,15 +552,78 @@ def _download_task(
                 file=d.get("filename"),
             )
 
-        _job_set(jid, status="downloading")
-        # indir() blocking'tir; output TABAN klasördür.
-        # Dosya: <output_base>/<anime_slug>/<bolum_slug>.<ext> olarak iner.
-        video.indir(callback=hook, output=output_base)
+        # Kaynak akışı yarıda kesilebildiği için birden fazla player denenir;
+        # başarısız olan player sonraki denemede hariç tutulur.
+        tried_players: list = []
+        exclude: set = set()
+        last_error: Optional[str] = None
 
-        _job_set(jid, status="finished")
-        if rename:
-            _finalize_file(jid, output_base, season_folder, bolum, pos)
-        log.info("[%s] tamamlandı: %s", jid, bolum.slug)
+        for attempt in range(1, _MAX_SOURCE_ATTEMPTS + 1):
+            if _is_cancelled(jid):
+                _job_set(jid, status="cancelled")
+                _cleanup_partials(output_base, anime_slug, bolum)
+                log.info("[%s] iptal edildi: %s", jid, bolum.slug)
+                return
+
+            _job_set(jid, status="kaynak_araniyor")
+            try:
+                video = _pick_video(bolum, max_resolution, fansub, exclude, bv_callback)
+            except Exception as exc:
+                last_error = f"kaynak seçilemedi: {exc}"
+                log.warning("[%s] %s", jid, last_error)
+                break
+
+            if video is None:
+                last_error = "Çalışan (kalan) kaynak bulunamadı."
+                log.info("[%s] deneme %d: çalışan kaynak yok: %s", jid, attempt, bolum.slug)
+                break
+
+            player = getattr(video, "player", None)
+            tried_players.append(player or "?")
+            exclude.add(player)  # bu deneme başarısız olursa aynı player'ı tekrar seçme
+            _job_set(
+                jid,
+                player=player,
+                fansub=getattr(video, "fansub", None),
+                percent=None, speed=None, eta=None, error=None,
+            )
+
+            # Kopan bağlantıya karşı biraz daha dayanıklılık.
+            try:
+                video.ydl_opts = {**video.ydl_opts, "retries": 15, "fragment_retries": 20}
+            except Exception:  # pragma: no cover
+                pass
+
+            _job_set(jid, status="downloading")
+            log.info("[%s] deneme %d/%d, player=%s: indiriliyor %s",
+                     jid, attempt, _MAX_SOURCE_ATTEMPTS, player, bolum.slug)
+            # indir() blocking'tir; output TABAN klasördür.
+            # Dosya: <output_base>/<anime_slug>/<bolum_slug>.<ext> olarak iner.
+            video.indir(callback=hook, output=output_base)
+
+            # yt-dlp ignoreerrors yüzünden yarıda kesilse de hatasız döner:
+            # diske bakıp GERÇEKTEN bitti mi kontrol et.
+            if _download_complete(output_base, anime_slug, bolum):
+                _job_set(jid, status="finished", error=None)
+                if rename:
+                    _finalize_file(jid, output_base, season_folder, bolum, pos)
+                log.info("[%s] tamamlandı (player=%s): %s", jid, player, bolum.slug)
+                return
+
+            # Eksik indirme: yarım dosyayı temizle, farklı kaynağı dene.
+            last_error = f"'{player}' kaynağı akışı yarıda kesti (eksik indirme)."
+            log.warning("[%s] deneme %d eksik kaldı (player=%s), sıradaki kaynak denenecek: %s",
+                        jid, attempt, player, bolum.slug)
+            _cleanup_partials(output_base, anime_slug, bolum)
+
+        # Tüm denemeler tükendi → dürüstçe hata bildir (asla yanlış "finished").
+        msg = "İndirme tamamlanamadı"
+        if tried_players:
+            msg += f" (denenen kaynaklar: {', '.join(tried_players)})"
+        if last_error:
+            msg += f". {last_error}"
+        _job_set(jid, status="error", error=msg)
+        log.error("[%s] %s: %s", jid, msg, bolum.slug)
 
     except _Cancelled:
         _job_set(jid, status="cancelled", error=None)
@@ -443,10 +633,15 @@ def _download_task(
         # İptal, best_video gibi yerlerde farklı bir exception olarak da gelebilir.
         if _is_cancelled(jid):
             _job_set(jid, status="cancelled", error=None)
+            _cleanup_partials(output_base, anime_slug, bolum)
             log.info("[%s] iptal edildi (araması sırasında): %s", jid, bolum.slug)
         else:
             _job_set(jid, status="error", error=str(exc))
+            _cleanup_partials(output_base, anime_slug, bolum)
             log.exception("[%s] indirme hatası: %s", jid, exc)
+    finally:
+        if slot_held:
+            _release_slot()
 
 
 # --------------------------------------------------------------------------- #
@@ -515,8 +710,12 @@ def _start_downloads(
     fansub: Optional[str],
     max_resolution: bool,
     rename: bool,
+    max_workers: Optional[int] = None,
 ) -> dict:
     """İndirme işlerini kuran çekirdek mantık (araçlar bunu çağırır)."""
+    # Eşzamanlı indirme sınırını bu çağrıya göre ayarla (None → varsayılan=1).
+    parallel = _set_parallel_limit(max_workers)
+
     anime = _get_anime(anime_slug)
     anime_title = getattr(anime, "title", anime_slug)
     secili = _resolve_bolumler(anime, episodes)
@@ -557,6 +756,7 @@ def _start_downloads(
         "output_dir": output_base,
         "target_dir": season_dir,
         "queued": len(jobs_out),
+        "parallel": parallel,
         "jobs": jobs_out,
         "job_ids": [j["job_id"] for j in jobs_out],
     }
@@ -571,6 +771,7 @@ def download_episodes(
     fansub: Optional[str] = None,
     max_resolution: bool = True,
     rename: bool = True,
+    max_workers: Optional[int] = None,
 ) -> dict:
     """Bir animenin belirtilen bölümlerini ARKA PLANDA indir.
 
@@ -599,14 +800,17 @@ def download_episodes(
         max_resolution: True ise en yüksek çözünürlüğü tercih eder.
         rename: True ise dosyayı düzenli alt klasöre taşıyıp "<Başlık> - NNN.ext"
             biçiminde adlandırır.
+        max_workers: Aynı anda kaç bölümün paralel ineceği. Verilmezse varsayılan
+            1 (tek tek). Örn. 3 verirsen 3 bölüm aynı anda iner. Bu değer sunucu
+            genelindeki eşzamanlılık sınırını ayarlar (son çağrı geçerlidir).
 
     Returns:
-        {"output_dir", "target_dir", "queued", "jobs":[...], "job_ids":[...]}
+        {"output_dir", "target_dir", "queued", "parallel", "jobs":[...], "job_ids":[...]}
     """
     try:
         return _start_downloads(
             anime_slug, episodes, output_dir, subfolder,
-            fansub, max_resolution, rename,
+            fansub, max_resolution, rename, max_workers,
         )
     except Exception as exc:
         log.exception("download_episodes hatası")
@@ -621,12 +825,13 @@ def download_season(
     fansub: Optional[str] = None,
     max_resolution: bool = True,
     rename: bool = True,
+    max_workers: Optional[int] = None,
 ) -> dict:
     """Bir animenin (sezonun) TÜM bölümlerini ARKA PLANDA, asenkron indir.
 
     TürkAnime'de her sezon ayrı bir slug'tır (örn. "shingeki-no-kyojin",
     "shingeki-no-kyojin-season-2"). Bu araç o slug'ın tüm bölümlerini
-    aynı anda kuyruğa alır; TURKANIME_MAX_WORKERS kadarı paralel iner.
+    kuyruğa alır; `max_workers` kadarı paralel iner (verilmezse tek tek).
     Tümü `<output_dir>/<Anime Başlığı>/` altında toplanır.
 
     Args:
@@ -636,14 +841,16 @@ def download_season(
         fansub: Tercih edilen fansub grubu (None = filtre yok).
         max_resolution: True ise en yüksek çözünürlük.
         rename: True ise düzenli adlandırma + alt klasöre taşıma.
+        max_workers: Aynı anda kaç bölümün paralel ineceği. Verilmezse varsayılan
+            1 (tek tek). Örn. 3 → 3 bölüm aynı anda.
 
     Returns:
-        {"output_dir", "target_dir", "queued", "jobs":[...], "job_ids":[...]}
+        {"output_dir", "target_dir", "queued", "parallel", "jobs":[...], "job_ids":[...]}
     """
     try:
         return _start_downloads(
             anime_slug, "all", output_dir, subfolder,
-            fansub, max_resolution, rename,
+            fansub, max_resolution, rename, max_workers,
         )
     except Exception as exc:
         log.exception("download_season hatası")
@@ -784,7 +991,9 @@ def list_fansubs(anime_slug: str, episode: Union[int, str] = 0) -> dict:
 
 def main() -> None:
     """stdio üzerinden MCP sunucusunu çalıştır."""
-    log.info("turkanime-mcp başlatılıyor (max_workers=%d)", _MAX_WORKERS)
+    log.info("turkanime-mcp başlatılıyor (varsayılan paralel=%d, havuz=%d, "
+             "kaynak deneme=%d)", _DEFAULT_PARALLEL, _WORKER_POOL_SIZE,
+             _MAX_SOURCE_ATTEMPTS)
     if _DEFAULT_OUTPUT_DIR:
         log.info("Varsayılan indirme klasörü: %s", _DEFAULT_OUTPUT_DIR)
     # ffmpeg bazı formatların birleştirilmesi için gereklidir; yoksa uyar.
