@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import shutil
 import logging
 import threading
 from uuid import uuid4
@@ -137,6 +138,21 @@ _JOBS_LOCK = threading.Lock()
 _ANIME_CACHE: dict[str, Any] = {}
 _ANIME_LOCK = threading.Lock()
 
+# İşin tamamlandığı sayılan durumlar (temizleme/özet için)
+_DONE_STATUSES = {"finished", "error", "cancelled"}
+
+
+class _Cancelled(Exception):
+    """İptal edilen indirmeyi normal hatadan ayırmak için işaret exception'ı."""
+
+
+def _is_cancelled(jid: str) -> bool:
+    """İş için iptal istenmiş mi (thread-güvenli)."""
+    with _JOBS_LOCK:
+        job = JOBS.get(jid)
+        return bool(job and job.get("cancel"))
+
+
 mcp = FastMCP("turkanime")
 
 
@@ -160,18 +176,22 @@ def _job_set(jid: str, **fields: Any) -> None:
             JOBS[jid].update(fields)
 
 
-def _get_anime(slug: str):
+def _get_anime(slug: str, refresh: bool = False):
     """Anime nesnesini kurar, fetch_info() çağırır ve önbelleğe alır.
 
     fetch_info() şarttır: aksi halde anime_id boş kalır ve bölüm listesi
     gelmez (bkz. dokümantasyon §7.1).
+
+    refresh=True ise önbellek atlanır ve site yeniden çekilir (yeni yayınlanan
+    bölümleri görmek için — aksi halde yeniden başlatana kadar eski liste döner).
     """
     slug = (slug or "").strip()
     if not slug:
         raise ValueError("anime_slug boş olamaz.")
-    with _ANIME_LOCK:
-        if slug in _ANIME_CACHE:
-            return _ANIME_CACHE[slug]
+    if not refresh:
+        with _ANIME_LOCK:
+            if slug in _ANIME_CACHE:
+                return _ANIME_CACHE[slug]
     ta = _get_ta()
     anime = ta.Anime(slug)
     anime.fetch_info()  # info + anime_id doldurur; bölüm listesi için ŞART
@@ -322,6 +342,27 @@ def _finalize_file(
         log.warning("[%s] dosya taşınamadı/adlandırılamadı: %s", jid, exc)
 
 
+def _cleanup_partials(output_base: str, anime_slug: str, bolum: Any) -> None:
+    """İptal sonrası yarım kalan .part / fragment dosyalarını temizler (best-effort)."""
+    try:
+        folder = os.path.join(output_base, anime_slug)
+        if not os.path.isdir(folder):
+            return
+        prefix = getattr(bolum, "slug", "")
+        for name in os.listdir(folder):
+            if prefix and name.startswith(prefix):
+                try:
+                    os.remove(os.path.join(folder, name))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(folder)  # boşsa kaldır
+        except OSError:
+            pass
+    except Exception:  # pragma: no cover
+        pass
+
+
 def _download_task(
     jid: str,
     anime_slug: str,
@@ -336,6 +377,12 @@ def _download_task(
 ) -> None:
     """Tek bir bölümü indiren arka plan işi (thread havuzunda çalışır)."""
     try:
+        # Kuyrukta beklerken iptal edildiyse hiç başlama.
+        if _is_cancelled(jid):
+            _job_set(jid, status="cancelled")
+            log.info("[%s] başlamadan iptal edildi: %s", jid, bolum.slug)
+            return
+
         _job_set(jid, status="kaynak_araniyor")
 
         def bv_callback(d: dict) -> None:
@@ -365,6 +412,9 @@ def _download_task(
         )
 
         def hook(d: dict) -> None:
+            # İptal istendiyse hook'tan exception fırlat → yt-dlp indirmeyi durdurur.
+            if _is_cancelled(jid):
+                raise _Cancelled()
             # yt-dlp progress_hooks callback'i
             _job_set(
                 jid,
@@ -385,9 +435,18 @@ def _download_task(
             _finalize_file(jid, output_base, season_folder, bolum, pos)
         log.info("[%s] tamamlandı: %s", jid, bolum.slug)
 
+    except _Cancelled:
+        _job_set(jid, status="cancelled", error=None)
+        _cleanup_partials(output_base, anime_slug, bolum)
+        log.info("[%s] iptal edildi: %s", jid, bolum.slug)
     except Exception as exc:  # geniş yakalama — thread'i sessizce düşürmemek için
-        _job_set(jid, status="error", error=str(exc))
-        log.exception("[%s] indirme hatası: %s", jid, exc)
+        # İptal, best_video gibi yerlerde farklı bir exception olarak da gelebilir.
+        if _is_cancelled(jid):
+            _job_set(jid, status="cancelled", error=None)
+            log.info("[%s] iptal edildi (araması sırasında): %s", jid, bolum.slug)
+        else:
+            _job_set(jid, status="error", error=str(exc))
+            log.exception("[%s] indirme hatası: %s", jid, exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -416,7 +475,7 @@ def search_anime(query: str) -> list[dict]:
 
 
 @mcp.tool()
-def list_episodes(anime_slug: str) -> dict:
+def list_episodes(anime_slug: str, refresh: bool = False) -> dict:
     """Bir animenin bölümlerini ve temel bilgisini listele.
 
     `index` değerleri 0-tabanlıdır ve download_episodes'un `episodes`
@@ -424,12 +483,14 @@ def list_episodes(anime_slug: str) -> dict:
 
     Args:
         anime_slug: search_anime'den gelen anime slug'ı (örn. "one-piece").
+        refresh: True ise önbelleği atlayıp siteyi yeniden çeker (yeni yayınlanan
+            bölümleri görmek için).
 
     Returns:
         {"title", "ozet", "episodes": [{"index", "slug", "title"}, ...]}
     """
     try:
-        anime = _get_anime(anime_slug)
+        anime = _get_anime(anime_slug, refresh=refresh)
         info = getattr(anime, "info", {}) or {}
         episodes = [
             {"index": i, "slug": b.slug, "title": b.title}
@@ -483,6 +544,7 @@ def _start_downloads(
                 "eta": None,
                 "file": None,
                 "error": None,
+                "cancel": False,
             }
         _EXECUTOR.submit(
             _download_task,
@@ -618,9 +680,117 @@ def download_status(job_id: Optional[str] = None) -> Union[dict, list]:
         return {"error": f"Durum alınamadı: {exc}"}
 
 
+@mcp.tool()
+def cancel_download(job_id: str) -> dict:
+    """Devam eden ya da kuyruktaki bir indirmeyi iptal et.
+
+    İndirme sürüyorsa yt-dlp bir sonraki ilerleme adımında durdurulur ve yarım
+    dosyalar temizlenir. Zaten bitmiş/hatalı işlerde bir şey yapılmaz.
+
+    Args:
+        job_id: İptal edilecek işin id'si.
+
+    Returns:
+        {"job_id", "status", "message"}
+    """
+    try:
+        with _JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is None:
+                return {"error": f"İş bulunamadı: {job_id}"}
+            status = job.get("status")
+            if status in _DONE_STATUSES:
+                return {"job_id": job_id, "status": status,
+                        "message": "İş zaten tamamlanmış; iptal edilemez."}
+            job["cancel"] = True
+        return {"job_id": job_id, "status": "cancelling",
+                "message": "İptal istendi; kısa süre içinde duracak."}
+    except Exception as exc:
+        log.exception("cancel_download hatası")
+        return {"error": f"İptal edilemedi: {exc}"}
+
+
+@mcp.tool()
+def cancel_all() -> dict:
+    """Devam eden ve kuyrukta bekleyen TÜM indirmeleri iptal et.
+
+    Returns:
+        {"cancelling": <adet>, "job_ids": [...]}
+    """
+    try:
+        affected = []
+        with _JOBS_LOCK:
+            for jid, job in JOBS.items():
+                if job.get("status") not in _DONE_STATUSES:
+                    job["cancel"] = True
+                    affected.append(jid)
+        return {"cancelling": len(affected), "job_ids": affected}
+    except Exception as exc:
+        log.exception("cancel_all hatası")
+        return {"error": f"İptal edilemedi: {exc}"}
+
+
+@mcp.tool()
+def clear_finished_jobs() -> dict:
+    """Tamamlanmış (finished/error/cancelled) işleri iş listesinden temizle.
+
+    Devam eden/kuyruktaki işlere dokunmaz. Uzun oturumlarda iş listesinin
+    şişmesini önler.
+
+    Returns:
+        {"removed": <adet>, "remaining": <adet>}
+    """
+    try:
+        with _JOBS_LOCK:
+            done = [jid for jid, job in JOBS.items()
+                    if job.get("status") in _DONE_STATUSES]
+            for jid in done:
+                del JOBS[jid]
+            remaining = len(JOBS)
+        return {"removed": len(done), "remaining": remaining}
+    except Exception as exc:
+        log.exception("clear_finished_jobs hatası")
+        return {"error": f"Temizlenemedi: {exc}"}
+
+
+@mcp.tool()
+def list_fansubs(anime_slug: str, episode: Union[int, str] = 0) -> dict:
+    """Bir bölüm için mevcut fansub gruplarını listele.
+
+    download_episodes/download_season'daki `fansub` parametresine bu adlardan
+    birini verebilirsin.
+
+    Args:
+        anime_slug: Anime slug'ı.
+        episode: Bölüm (0-tabanlı index ya da bölüm slug'ı). Varsayılan ilk bölüm.
+
+    Returns:
+        {"anime", "bolum", "fansubs": [<ad>, ...]}
+    """
+    try:
+        anime = _get_anime(anime_slug)
+        secili = _resolve_bolumler(anime, episode)
+        bolum = secili[0]
+        fansubs = list(getattr(bolum, "fansubs", []) or [])
+        return {
+            "anime": getattr(anime, "title", anime_slug),
+            "bolum": bolum.title,
+            "fansubs": fansubs,
+        }
+    except Exception as exc:
+        log.exception("list_fansubs hatası")
+        return {"error": f"Fansublar alınamadı: {exc}"}
+
+
 def main() -> None:
     """stdio üzerinden MCP sunucusunu çalıştır."""
     log.info("turkanime-mcp başlatılıyor (max_workers=%d)", _MAX_WORKERS)
+    if _DEFAULT_OUTPUT_DIR:
+        log.info("Varsayılan indirme klasörü: %s", _DEFAULT_OUTPUT_DIR)
+    # ffmpeg bazı formatların birleştirilmesi için gereklidir; yoksa uyar.
+    if shutil.which("ffmpeg") is None:
+        log.warning("ffmpeg PATH'te bulunamadı — bazı bölümlerin ses/video "
+                    "birleştirmesi başarısız olabilir. Kurulum: winget install Gyan.FFmpeg")
     mcp.run()  # varsayılan transport: stdio
 
 

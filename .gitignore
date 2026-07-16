@@ -11,3 +11,7 @@ venv/
 # MCP sunucusu — yerele özel / üretilen
 cacert.pem
 .claude/
+
+# Çalışma/meta dosyaları — repoya dahil değil
+claude-code-promptu.md
+turkanime-api-dokumantasyon.md

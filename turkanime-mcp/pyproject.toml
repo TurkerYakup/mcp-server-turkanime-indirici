@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turkanime-mcp"
+version = "0.1.0"
+description = "TürkAnime İndirici için stdio tabanlı MCP sunucusu (turkanime-cli sarmalayıcısı)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "CC-BY-NC-ND-4.0" }
+authors = [{ name = "TurkerYakup" }]
+keywords = ["mcp", "turkanime", "anime", "yt-dlp", "claude"]
+
+dependencies = [
+    "mcp>=1.2.0",
+    "turkanime-cli>=10.0.3",
+    "pywin32>=306 ; sys_platform == 'win32'",
+]
+
+[project.urls]
+Homepage = "https://github.com/TurkerYakup/mcp-server-turkanime-indirici"
+Upstream = "https://github.com/KebabLord/turkanime-indirici"
+
+[project.scripts]
+# Kurulunca: `turkanime-mcp` komutu doğrudan sunucuyu başlatır.
+turkanime-mcp = "turkanime_mcp:main"
+
+[tool.setuptools]
+py-modules = ["turkanime_mcp"]

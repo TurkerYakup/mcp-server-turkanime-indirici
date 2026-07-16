@@ -40,10 +40,14 @@ olarak açar. Kullanıcı sohbette isteğini yazar, Claude uygun aracı çağır
 | Araç | Ne yapar | Döner |
 |------|----------|-------|
 | `search_anime(query)` | Anime arar | `[{slug, title}]` |
-| `list_episodes(anime_slug)` | Bölümleri + özeti listeler | `{title, ozet, episodes:[{index, slug, title}]}` |
+| `list_episodes(anime_slug, refresh?)` | Bölümleri + özeti listeler (`refresh` yeni bölümler için) | `{title, ozet, episodes:[{index, slug, title}]}` |
+| `list_fansubs(anime_slug, episode?)` | Bölümün mevcut fansub gruplarını listeler | `{anime, bolum, fansubs:[…]}` |
 | `download_episodes(anime_slug, episodes, …)` | Seçili bölümleri **arka planda** indirir | `{job_ids, target_dir, …}` |
 | `download_season(anime_slug, …)` | **Tüm sezonu** asenkron indirir | `{job_ids, target_dir, …}` |
 | `download_status(job_id?)` | İndirme durumunu sorgular | `[{status, percent, speed, eta, file, …}]` |
+| `cancel_download(job_id)` | Bir indirmeyi iptal eder (yarım dosyaları temizler) | `{job_id, status, message}` |
+| `cancel_all()` | Devam eden/kuyruktaki tüm indirmeleri iptal eder | `{cancelling, job_ids}` |
+| `clear_finished_jobs()` | Biten/hatalı/iptal işleri listeden temizler | `{removed, remaining}` |
 
 ### `episodes` parametresi esnektir
 
@@ -87,6 +91,12 @@ Python **3.10+** gerekir.
 git clone https://github.com/TurkerYakup/mcp-server-turkanime-indirici.git
 cd mcp-server-turkanime-indirici\turkanime-mcp
 pip install -r requirements.txt
+```
+
+İsterseniz paket olarak da kurabilirsiniz (bir `turkanime-mcp` komutu oluşturur):
+
+```powershell
+pip install .
 ```
 
 > **pywin32 notu:** Windows'ta resmi `mcp` SDK'sinin stdio katmanı `pywintypes` modülüne
