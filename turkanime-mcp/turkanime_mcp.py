@@ -1,15 +1,33 @@
 """TürkAnime İndirici MCP Sunucusu (stdio).
 
 `turkanime-cli` (KebabLord/turkanime-indirici) paketini saran, Claude Desktop
-için stdio tabanlı bir MCP sunucusu. Dört araç sunar:
+için stdio tabanlı bir MCP sunucusu. Sunduğu araçlar:
 
-    search_anime(query)                    -> anime ara
+  Arama / listeleme
+    search_anime(query)                    -> anime ara (AnimeDepo fallback'li)
     list_episodes(anime_slug)              -> bölümleri listele
+    list_fansubs(anime_slug, episode)      -> bölümün fansublarını listele
+
+  İndirme
     download_episodes(anime_slug, ...)     -> arka planda indir (hemen döner)
-    download_status(job_id=None)           -> indirme durumunu sorgula
+    download_season(anime_slug, ...)       -> tüm sezonu indir
+    verify_library(anime_slug, ...)        -> eksik/yarım bölümleri bul (+onar)
+    check_new_episodes(anime_slug, ...)    -> yeni bölüm var mı (+otomatik indir)
+
+  İş yönetimi
+    download_status(job_id, ...)           -> indirme durumunu sorgula
+    get_batch_summary(job_ids=None)        -> toplu ilerleme özeti
+    retry_job(job_id)                      -> hatalı/kesilen işi yeniden dene
+    cancel_download(job_id) / cancel_all() -> iptal
+    clear_finished_jobs()                  -> biten işleri listeden temizle
+
+  Teşhis
+    health_check()                         -> erişim/ffmpeg/klasör/SSL kontrolü
 
 Kurulu `turkanime_api` paketini import ederek kullanır; depoyu vendorlamaz.
 Sadece kişisel kullanım içindir; sadece mevcut kütüphaneyi sarar.
+
+İş durumu diske (jobs.json) yazılır; sunucu yeniden başlasa da geçmiş korunur.
 
 Not: MCP protokolü stdout'u kullanır — bu yüzden tüm log'lar stderr'e yazılır.
 """

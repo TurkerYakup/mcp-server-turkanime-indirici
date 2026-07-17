@@ -11,3 +11,9 @@ Hızlı başlangıç:
 pip install -r requirements.txt
 python turkanime_mcp.py   # stdio bekler; Claude Desktop üzerinden kullanılır
 ```
+
+Testler (ağ/`turkanime_api` gerektirmez, ek bağımlılık yok — depo kökünden çalıştırın):
+
+```powershell
+python -m unittest discover -s turkanime-mcp/tests -t turkanime-mcp/tests
+```
