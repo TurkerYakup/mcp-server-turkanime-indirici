@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+import json
+import time
 import shutil
 import logging
 import threading
@@ -197,8 +199,122 @@ _JOBS_LOCK = threading.Lock()
 _ANIME_CACHE: dict[str, Any] = {}
 _ANIME_LOCK = threading.Lock()
 
-# İşin tamamlandığı sayılan durumlar (temizleme/özet için)
-_DONE_STATUSES = {"finished", "error", "cancelled"}
+# İşin tamamlandığı sayılan durumlar (temizleme/özet için).
+# "interrupted": sunucu yeniden başlatıldığında yarıda kalmış işler bu duruma
+# alınır — thread'leri artık yok, yani devam eden bir iş DEĞİL.
+_DONE_STATUSES = {"finished", "error", "cancelled", "interrupted"}
+
+# Restart sonrası "hâlâ iniyor" yalanını önlemek için: bu durumlardaki işler
+# yüklenirken "interrupted" işaretlenir.
+_INTERRUPTED_MSG = "Sunucu yeniden başlatıldı; iş yarıda kesildi."
+
+
+# --------------------------------------------------------------------------- #
+# Kalıcı durum: JOBS yalnızca RAM'de olduğundan restart'ta iş geçmişi kaybolurdu.
+# jobs.json'a yazılır; açılışta geri yüklenir.
+# --------------------------------------------------------------------------- #
+def _default_state_dir() -> str:
+    """Kalıcı durum klasörü: TURKANIME_STATE_DIR > %PROGRAMDATA% > ~/.turkanime-mcp."""
+    env = os.environ.get("TURKANIME_STATE_DIR", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    programdata = os.environ.get("PROGRAMDATA", "").strip()
+    if programdata and os.path.isdir(programdata):
+        return os.path.join(programdata, "turkanime-mcp")
+    return os.path.join(os.path.expanduser("~"), ".turkanime-mcp")
+
+
+_STATE_DIR = _default_state_dir()
+_STATE_FILE = os.path.join(_STATE_DIR, "jobs.json")
+
+# Disk'i dövmemek için debounce: `status` değişimi ANINDA yazılır, ara ilerleme
+# (percent/speed) güncellemeleri en fazla bu aralıkta bir flush edilir.
+_STATE_FLUSH_SECS = max(0.0, float(os.environ.get("TURKANIME_STATE_FLUSH_SECS", "1.0")))
+
+# _STATE_LOCK bir YAPRAK kilittir: yalnızca dosya G/Ç'sini ve aşağıdaki iki
+# sayacı korur. Bu kilit tutulurken ASLA _JOBS_LOCK alınmaz (deadlock önlemi).
+_STATE_LOCK = threading.Lock()
+_state_last_flush = 0.0   # _STATE_LOCK altında
+_state_written_seq = 0    # _STATE_LOCK altında — eski snapshot'ın yenisini ezmesini önler
+_state_seq = 0            # _JOBS_LOCK altında — her değişiklikte artar
+
+
+def _bump_state_seq_locked() -> None:
+    """Durum sıra numarasını artırır. ÇAĞIRAN _JOBS_LOCK'u tutuyor olmalı."""
+    global _state_seq
+    _state_seq += 1
+
+
+def _snapshot_jobs() -> tuple[dict, int]:
+    """JOBS'un JSON'a yazılabilir kopyasını + sıra numarasını döndürür."""
+    with _JOBS_LOCK:
+        return {jid: dict(job) for jid, job in JOBS.items()}, _state_seq
+
+
+def _write_state_file(jobs: dict, seq: int) -> None:
+    """jobs.json'ı atomik yazar (temp + os.replace). Eski snapshot'ı atlar."""
+    global _state_written_seq
+    with _STATE_LOCK:
+        if seq < _state_written_seq:
+            return  # daha yeni bir snapshot zaten yazılmış
+        payload = {"version": 1, "jobs": jobs}
+        try:
+            os.makedirs(_STATE_DIR, exist_ok=True)
+            tmp = _STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, _STATE_FILE)
+            _state_written_seq = seq
+        except Exception as exc:  # pragma: no cover — durum kaydı indirmeyi düşürmemeli
+            log.warning("İş durumu kaydedilemedi (%s): %s", _STATE_FILE, exc)
+
+
+def _persist_jobs(force: bool = False) -> None:
+    """İş durumunu diske yazar. force=False ise debounce aralığına uyar."""
+    global _state_last_flush
+    with _STATE_LOCK:
+        now = time.monotonic()
+        if not force and (now - _state_last_flush) < _STATE_FLUSH_SECS:
+            return  # ara ilerleme güncellemesi — atlanabilir, kayıp önemsiz
+        _state_last_flush = now
+    jobs, seq = _snapshot_jobs()
+    _write_state_file(jobs, seq)
+
+
+def _load_state() -> int:
+    """jobs.json'ı JOBS'a yükler; yarıda kalan işleri 'interrupted' işaretler.
+
+    Restart sonrası thread'ler yok olduğundan `downloading`/`queued`/
+    `kaynak_araniyor` gibi durumlar YALAN olur; bunlar interrupted'a çevrilir.
+    Returns: yüklenen iş sayısı.
+    """
+    try:
+        if not os.path.exists(_STATE_FILE):
+            return 0
+        with open(_STATE_FILE, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        saved = (payload or {}).get("jobs") or {}
+    except Exception as exc:
+        log.warning("İş durumu okunamadı (%s): %s", _STATE_FILE, exc)
+        return 0
+
+    kesilen = 0
+    with _JOBS_LOCK:
+        for jid, job in saved.items():
+            if not isinstance(job, dict):
+                continue
+            if job.get("status") not in _DONE_STATUSES:
+                job["status"] = "interrupted"
+                job["error"] = job.get("error") or _INTERRUPTED_MSG
+                kesilen += 1
+            job["cancel"] = False  # thread yok; bayrak anlamsız
+            job["restored"] = True
+            JOBS[jid] = job
+        yuklenen = len(saved)
+    if yuklenen:
+        log.info("Önceki oturumdan %d iş yüklendi (%d tanesi yarıda kesilmiş).",
+                 yuklenen, kesilen)
+    return yuklenen
 
 
 class _Cancelled(Exception):
@@ -229,10 +345,20 @@ def _sanitize(name: str) -> str:
 
 
 def _job_set(jid: str, **fields: Any) -> None:
-    """İş sözlüğünü thread-güvenli günceller."""
+    """İş sözlüğünü thread-güvenli günceller ve durumu kalıcılaştırır.
+
+    `status` değişimi anında flush edilir (restart sonrası doğru durum için);
+    salt ilerleme (percent/speed/eta) güncellemeleri debounce'a tabidir.
+    """
+    global _state_seq
     with _JOBS_LOCK:
-        if jid in JOBS:
-            JOBS[jid].update(fields)
+        job = JOBS.get(jid)
+        if job is None:
+            return
+        status_degisti = "status" in fields and fields["status"] != job.get("status")
+        job.update(fields)
+        _state_seq += 1
+    _persist_jobs(force=status_degisti)
 
 
 def _get_anime(slug: str, refresh: bool = False):
@@ -861,11 +987,13 @@ def _start_downloads(
     # ile aynı numarayı üretmesi için gerçek index şart.
     idx_map = {id(b): i for i, b in enumerate(anime.bolumler)}
 
+    global _state_seq
     jobs_out = []
     for bolum in secili:
         pos = idx_map.get(id(bolum), 0)
         jid = str(uuid4())
         with _JOBS_LOCK:
+            _state_seq += 1
             JOBS[jid] = {
                 "job_id": jid,
                 "anime": anime_title,
@@ -888,6 +1016,7 @@ def _start_downloads(
         )
         jobs_out.append({"job_id": jid, "anime": anime_title, "bolum": bolum.title})
 
+    _persist_jobs(force=True)
     return {
         "output_dir": output_base,
         "target_dir": season_dir,
@@ -994,18 +1123,29 @@ def download_season(
 
 
 @mcp.tool()
-def download_status(job_id: Optional[str] = None) -> Union[dict, list]:
+def download_status(job_id: Optional[str] = None,
+                    include_history: bool = True) -> Union[dict, list]:
     """İndirme işlerinin durumunu sorgula.
+
+    İş durumu diske kaydedilir; sunucu yeniden başlasa bile önceki oturumun
+    işleri burada görünür. Restart'ta yarıda kalan işler `interrupted` olur
+    (asla yanlışlıkla "hâlâ iniyor" gösterilmez); `retry_job` ile tekrar
+    kuyruğa alınabilirler.
 
     Args:
         job_id: Belirli bir işin id'si. None ise tüm işler döner.
+        include_history: True (varsayılan) ise biten/hatalı/iptal/kesilen işler
+            de listelenir. False ise yalnızca AKTİF işler (queued/downloading/
+            kaynak_araniyor) döner. `job_id` verildiyse bu parametre yok sayılır.
 
     Returns:
         Tek iş için dict, tüm işler için liste. Alanlar:
-        job_id, anime, bolum, status, percent, speed, eta, file, error.
+        job_id, anime, bolum, status, percent, speed, eta, file, error,
+        player, fansub, target_dir, restored, retried_as.
     """
     fields = ("job_id", "anime", "bolum", "status", "percent",
-              "speed", "eta", "file", "error", "player", "fansub", "target_dir")
+              "speed", "eta", "file", "error", "player", "fansub", "target_dir",
+              "restored", "retried_as")
 
     def _view(job: dict) -> dict:
         return {k: job.get(k) for k in fields}
@@ -1017,7 +1157,8 @@ def download_status(job_id: Optional[str] = None) -> Union[dict, list]:
                 if job is None:
                     return {"error": f"İş bulunamadı: {job_id}"}
                 return _view(job)
-            return [_view(j) for j in JOBS.values()]
+            return [_view(j) for j in JOBS.values()
+                    if include_history or j.get("status") not in _DONE_STATUSES]
     except Exception as exc:
         log.exception("download_status hatası")
         return {"error": f"Durum alınamadı: {exc}"}
@@ -1046,6 +1187,8 @@ def cancel_download(job_id: str) -> dict:
                 return {"job_id": job_id, "status": status,
                         "message": "İş zaten tamamlanmış; iptal edilemez."}
             job["cancel"] = True
+            _bump_state_seq_locked()
+        _persist_jobs(force=True)
         return {"job_id": job_id, "status": "cancelling",
                 "message": "İptal istendi; kısa süre içinde duracak."}
     except Exception as exc:
@@ -1067,6 +1210,10 @@ def cancel_all() -> dict:
                 if job.get("status") not in _DONE_STATUSES:
                     job["cancel"] = True
                     affected.append(jid)
+            if affected:
+                _bump_state_seq_locked()
+        if affected:
+            _persist_jobs(force=True)
         return {"cancelling": len(affected), "job_ids": affected}
     except Exception as exc:
         log.exception("cancel_all hatası")
@@ -1090,6 +1237,10 @@ def clear_finished_jobs() -> dict:
             for jid in done:
                 del JOBS[jid]
             remaining = len(JOBS)
+            if done:
+                _bump_state_seq_locked()
+        if done:
+            _persist_jobs(force=True)
         return {"removed": len(done), "remaining": remaining}
     except Exception as exc:
         log.exception("clear_finished_jobs hatası")
@@ -1208,6 +1359,9 @@ def main() -> None:
              _MAX_SOURCE_ATTEMPTS)
     if _DEFAULT_OUTPUT_DIR:
         log.info("Varsayılan indirme klasörü: %s", _DEFAULT_OUTPUT_DIR)
+    # Önceki oturumun iş geçmişini geri yükle (yarıda kalanlar interrupted olur).
+    log.info("Durum dosyası: %s", _STATE_FILE)
+    _load_state()
     # ffmpeg bazı formatların birleştirilmesi için gereklidir; yoksa uyar.
     if shutil.which("ffmpeg") is None:
         log.warning("ffmpeg PATH'te bulunamadı — bazı bölümlerin ses/video "
