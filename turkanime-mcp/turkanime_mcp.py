@@ -184,6 +184,11 @@ _ALL_TOKENS = {"all", "hepsi", "tümü", "tumu", "tum", "*", "sezon", "season"}
 # başarısız deneme bant genişliği harcadığından makul bir üst sınır tutulur.
 _MAX_SOURCE_ATTEMPTS = max(1, int(os.environ.get("TURKANIME_SOURCE_ATTEMPTS", "3")))
 
+# Bir dosyanın "gerçek bir bölüm" sayılması için gereken en küçük boyut. Bunun
+# altındaki son dosyalar (0-byte kalıntılar, yarım bırakılmış parçalar) `partial`
+# kabul edilir. verify_library ve skip_existing bu eşiği kullanır.
+_MIN_VALID_BYTES = max(0, int(os.environ.get("TURKANIME_MIN_VALID_BYTES", str(1024 * 1024))))
+
 # job_id -> iş bilgisi dict'i
 JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
@@ -415,6 +420,131 @@ def _cleanup_partials(output_base: str, anime_slug: str, bolum: Any) -> None:
             pass
     except Exception:  # pragma: no cover
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Kütüphane tarama (verify_library / skip_existing ortak mantığı)
+# --------------------------------------------------------------------------- #
+# yt-dlp'nin yarım dosya son ekleri: "<ad>.part", "<ad>.ytdl", "<ad>.part-Frag12"
+_TEMP_SUFFIX_RE = re.compile(r"^(?P<base>.+?)\.(?:part|ytdl)(?:-Frag\d+)?$", re.IGNORECASE)
+
+
+def _strip_temp_suffix(name: str) -> tuple[str, bool]:
+    """('X.mp4.part') -> ('X.mp4', True); ('X.mp4') -> ('X.mp4', False)."""
+    m = _TEMP_SUFFIX_RE.match(name)
+    if m:
+        return m.group("base"), True
+    return name, False
+
+
+def _scan_dirs(dirs: list[str]) -> list[tuple[str, str]]:
+    """Verilen klasörleri tarayıp (klasör, dosya_adı) çiftleri döndürür.
+
+    Aynı klasör iki kez taranmaz. Windows'ta dosya sistemi büyük/küçük harf
+    duyarsız olduğundan `<kök>/Horimiya` ile `<kök>/horimiya` AYNI klasördür;
+    normcase ile tekilleştirilir (aksi halde her dosya iki kez sayılırdı).
+    """
+    seen: set = set()
+    out: list[tuple[str, str]] = []
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        key = os.path.normcase(os.path.abspath(d))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            for name in os.listdir(d):
+                out.append((d, name))
+        except OSError:
+            continue
+    return out
+
+
+def _file_belongs_to(stem: str, season_folder: str, num: str, bolum_slug: str) -> bool:
+    """Uzantısız dosya adı bu bölüme mi ait?
+
+    İki adlandırma da tanınır:
+      - `_finalize_file` çıktısı:  "<season_folder> - NNN"  (ve " (2)" çakışma eki)
+      - ham/yeniden adlandırılmamış: "<bolum_slug>" (yt-dlp format eki alabilir:
+        "<bolum_slug>.f137")
+    """
+    if bolum_slug and (stem == bolum_slug or stem.startswith(bolum_slug + ".")):
+        return True
+    prefix = f"{season_folder} - {num}"
+    return stem == prefix or stem.startswith(prefix + " (")
+
+
+def _episode_status(files: list[tuple[str, str]], season_folder: str,
+                    num: str, bolum_slug: str) -> tuple[str, list[str]]:
+    """Bir bölümün disk durumunu belirler -> ("ok"|"partial"|"missing", [dosyalar]).
+
+    - partial: `.part`/`.ytdl` var YA DA son dosya `_MIN_VALID_BYTES` altında.
+    - ok: eşikten büyük bir son dosya var ve yarım dosya yok.
+    - missing: eşleşen hiçbir dosya yok.
+    """
+    matched: list[str] = []
+    has_partial = False
+    has_final = False
+    for folder, name in files:
+        base, is_temp = _strip_temp_suffix(name)
+        stem = os.path.splitext(base)[0]
+        if not _file_belongs_to(stem, season_folder, num, bolum_slug):
+            continue
+        path = os.path.join(folder, name)
+        matched.append(path)
+        if is_temp:
+            has_partial = True
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size >= _MIN_VALID_BYTES:
+            has_final = True
+        else:
+            has_partial = True
+    if has_partial:
+        return "partial", matched
+    if has_final:
+        return "ok", matched
+    return "missing", matched
+
+
+def _library_states(anime: Any, output_base: str, season_folder: str,
+                    bolumler: Optional[list] = None) -> list[dict]:
+    """Bölümlerin disk durumunu çıkarır (verify_library + skip_existing ortak).
+
+    `bolumler` None ise animenin tüm bölümleri taranır; verilirse yalnızca o
+    alt küme. `index` daima animenin TAM listesindeki 0-tabanlı sırasıdır —
+    böylece `_episode_number` fallback'i ve indirme çağrıları tutarlı kalır.
+
+    Hem düzenlenmiş sezon klasörü hem de yt-dlp'nin ham indirme klasörü
+    (`<output_base>/<anime_slug>`) taranır; kullanıcının eski manuel/yarım
+    indirmeleri farklı adlandırılmış olabilir.
+    """
+    tumu = anime.bolumler
+    idx_map = {id(b): i for i, b in enumerate(tumu)}
+    hedef = tumu if bolumler is None else bolumler
+    files = _scan_dirs([
+        os.path.join(output_base, season_folder),
+        os.path.join(output_base, getattr(anime, "slug", "") or ""),
+    ])
+    out: list[dict] = []
+    for b in hedef:
+        pos = idx_map.get(id(b), 0)
+        num = _episode_number(b, pos)
+        status, matched = _episode_status(files, season_folder, num,
+                                          getattr(b, "slug", "") or "")
+        out.append({
+            "index": pos,
+            "episode": int(num),
+            "slug": getattr(b, "slug", None),
+            "title": getattr(b, "title", None),
+            "status": status,
+            "files": matched,
+        })
+    return out
 
 
 _SUPPORTED_CACHE: Optional[list] = None
@@ -726,8 +856,14 @@ def _start_downloads(
     season_folder = _sanitize(subfolder or anime_title or anime_slug)
     season_dir = os.path.join(output_base, season_folder)
 
+    # `pos`, animenin TAM listesindeki 0-tabanlı index'tir (seçim içindeki sıra
+    # değil). `_episode_number` slug'da rakam bulamazsa buna düşer; verify_library
+    # ile aynı numarayı üretmesi için gerçek index şart.
+    idx_map = {id(b): i for i, b in enumerate(anime.bolumler)}
+
     jobs_out = []
-    for pos, bolum in enumerate(secili):
+    for bolum in secili:
+        pos = idx_map.get(id(bolum), 0)
         jid = str(uuid4())
         with _JOBS_LOCK:
             JOBS[jid] = {
@@ -987,6 +1123,82 @@ def list_fansubs(anime_slug: str, episode: Union[int, str] = 0) -> dict:
     except Exception as exc:
         log.exception("list_fansubs hatası")
         return {"error": f"Fansublar alınamadı: {exc}"}
+
+
+@mcp.tool()
+def verify_library(
+    anime_slug: str,
+    output_dir: Optional[str] = None,
+    subfolder: Optional[str] = None,
+    repair: bool = False,
+    fansub: Optional[str] = None,
+    max_resolution: bool = True,
+    max_workers: Optional[int] = None,
+) -> dict:
+    """Bir animenin indirme klasörünü doğrula: hangi bölümler eksik/yarım?
+
+    Klasörü tarar ve her bölümü üç durumdan birine ayırır:
+      - `ok`: eşikten (varsayılan 1 MB) büyük son dosya var, yarım dosya yok.
+      - `partial`: `.part`/`.ytdl` ya da eşik altı/0-byte dosya var.
+      - `missing`: hiç dosya yok.
+
+    Hem düzenli `"<Başlık> - NNN.ext"` adlandırmasını hem de ham
+    `"<bolum_slug>.*"` adlandırmasını tanır (eski manuel indirmeler için).
+
+    `repair=True` verilirse eksik + yarım bölümleri ARKA PLANDA yeniden indirmeye
+    alır; ilerlemeyi download_status ile takip et.
+
+    Args:
+        anime_slug: Anime slug'ı.
+        output_dir: Kök klasör. Verilmezse config'deki TURKANIME_OUTPUT_DIR.
+        subfolder: Sezon alt klasörü (verilmezse anime başlığından türetilir).
+        repair: True ise eksik/yarım bölümleri kuyruğa alır. False = sadece rapor.
+        fansub: Onarım indirmelerinde tercih edilen fansub (None = filtre yok).
+        max_resolution: Onarım indirmelerinde en yüksek çözünürlüğü tercih et.
+        max_workers: Onarım indirmelerinde paralel iş sayısı.
+
+    Returns:
+        {"anime", "target_dir", "total_episodes", "ok":[...], "partial":[...],
+         "missing":[...], "repaired", "queued_job_ids":[...]}
+        Bölüm numaraları 1-tabanlıdır (dosya adındaki numarayla aynı).
+    """
+    try:
+        anime = _get_anime(anime_slug)
+        anime_title = getattr(anime, "title", anime_slug)
+        output_base = _resolve_base_dir(output_dir)
+        season_folder = _sanitize(subfolder or anime_title or anime_slug)
+        season_dir = os.path.join(output_base, season_folder)
+
+        states = _library_states(anime, output_base, season_folder)
+        result: dict[str, Any] = {
+            "anime": anime_title,
+            "target_dir": season_dir,
+            "total_episodes": len(states),
+            "ok": sorted(s["episode"] for s in states if s["status"] == "ok"),
+            "partial": sorted(s["episode"] for s in states if s["status"] == "partial"),
+            "missing": sorted(s["episode"] for s in states if s["status"] == "missing"),
+            "repaired": False,
+            "queued_job_ids": [],
+        }
+        if not repair:
+            return result
+
+        bozuk = [s["index"] for s in states if s["status"] in ("partial", "missing")]
+        result["repaired"] = True
+        if not bozuk:
+            result["note"] = "Onarılacak bölüm yok; kütüphane eksiksiz."
+            return result
+
+        started = _start_downloads(
+            anime_slug, bozuk, output_dir, subfolder,
+            fansub, max_resolution, True, max_workers,
+        )
+        result["queued_job_ids"] = started.get("job_ids", [])
+        result["queued"] = started.get("queued", 0)
+        return result
+    except Exception as exc:
+        log.exception("verify_library hatası")
+        return {"error": f"Kütüphane doğrulanamadı: {exc}"}
 
 
 def main() -> None:
