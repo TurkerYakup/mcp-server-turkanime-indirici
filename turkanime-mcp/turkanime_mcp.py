@@ -197,6 +197,12 @@ _MIN_VALID_BYTES = max(0, int(os.environ.get("TURKANIME_MIN_VALID_BYTES", str(10
 # kapalı (her zaman baştan indir).
 _RESUME_ATTEMPTS = max(0, int(os.environ.get("TURKANIME_RESUME_ATTEMPTS", "1")))
 
+# Arama denemesi sayısı ve backoff temeli (0.5s, 1.0s, ...). `arama_yap` site
+# anlık takıldığında boş liste dönebildiğinden boş sonuç da yeniden denenir;
+# upstream rate limit'e takılabildiği için deneme sayısı düşük tutulur.
+_SEARCH_RETRIES = max(1, int(os.environ.get("TURKANIME_SEARCH_RETRIES", "2")))
+_SEARCH_BACKOFF_SECS = max(0.0, float(os.environ.get("TURKANIME_SEARCH_BACKOFF", "0.5")))
+
 # job_id -> iş bilgisi dict'i
 JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
@@ -332,6 +338,82 @@ def _is_cancelled(jid: str) -> bool:
     with _JOBS_LOCK:
         job = JOBS.get(jid)
         return bool(job and job.get("cancel"))
+
+
+# --------------------------------------------------------------------------- #
+# Manifest: sağlayıcı/özellik kararları (yerel manifest.json'dan okunur).
+# Upstream CLI bunu uzaktan çeker; MCP her aramada ağ çağrısı yapmamak için
+# depodaki kopyayı okur. TURKANIME_MANIFEST ile başka bir yol verilebilir.
+# --------------------------------------------------------------------------- #
+_MANIFEST_CACHE: Optional[dict] = None
+_MANIFEST_LOCK = threading.Lock()
+
+
+def _manifest_candidates() -> list[str]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        os.environ.get("TURKANIME_MANIFEST", "").strip(),
+        os.path.join(here, "manifest.json"),
+        os.path.join(os.path.dirname(here), "manifest.json"),  # depo kökü
+    ]
+
+
+def _manifest() -> dict:
+    """Yerel manifest.json (tek seferlik okunur). Yoksa boş dict."""
+    global _MANIFEST_CACHE
+    with _MANIFEST_LOCK:
+        if _MANIFEST_CACHE is not None:
+            return _MANIFEST_CACHE
+        data: dict = {}
+        for path in _manifest_candidates():
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh) or {}
+                log.info("Manifest okundu: %s", path)
+                break
+            except Exception as exc:
+                log.warning("Manifest okunamadı (%s): %s", path, exc)
+        _MANIFEST_CACHE = data
+        return data
+
+
+def _client_version() -> Optional[tuple]:
+    """Kurulu turkanime-cli sürümü (min_client_version kontrolü için)."""
+    try:
+        from turkanime_api.cli.version import __version__
+        return tuple(int(i) for i in str(__version__).split("."))
+    except Exception:
+        pass
+    try:
+        import importlib.metadata as md
+        return tuple(int(i) for i in md.version("turkanime-cli").split("."))
+    except Exception:
+        return None
+
+
+def _provider_allowed(name: str) -> bool:
+    """Manifest'e göre sağlayıcı kullanılabilir mi (enabled + min_client_version)."""
+    conf = (_manifest().get("providers") or {}).get(name)
+    if conf is None:
+        return True  # manifest/sağlayıcı tanımlı değilse engelleme
+    if not conf.get("enabled", True):
+        return False
+    gereken = str(conf.get("min_client_version", "") or "").lower().lstrip("v")
+    if not gereken:
+        return True
+    mevcut = _client_version()
+    if mevcut is None:
+        return True  # sürüm okunamıyorsa engelleme (best-effort)
+    try:
+        return mevcut >= tuple(int(i) for i in gereken.split("."))
+    except Exception:
+        return True
+
+
+def _search_feature() -> dict:
+    return (_manifest().get("features") or {}).get("search") or {}
 
 
 mcp = FastMCP("turkanime")
@@ -976,26 +1058,117 @@ def _download_task(
 # --------------------------------------------------------------------------- #
 # MCP Araçları
 # --------------------------------------------------------------------------- #
-@mcp.tool()
-def search_anime(query: str) -> list[dict]:
-    """TürkAnime'de anime ara.
+def _search_turkanime(query: str) -> tuple[list, Optional[Exception]]:
+    """TürkAnime'de arar; kısa retry/backoff uygular. -> (sonuçlar, son_hata).
 
-    Verilen metinle eşleşen animeleri döndürür. Sonuçtaki `slug` değeri,
-    list_episodes ve download_episodes araçlarında kullanılır.
+    Site anlık takıldığında `arama_yap` istisna atmak yerine BOŞ liste de
+    dönebildiğinden boş sonuç da (bir kez) yeniden denenir. Rate limit riskine
+    karşı deneme sayısı düşük tutulur (TURKANIME_SEARCH_RETRIES).
+    """
+    ta = _get_ta()
+    son_hata: Optional[Exception] = None
+    for deneme in range(1, _SEARCH_RETRIES + 1):
+        try:
+            sonuc = list(ta.Anime.arama_yap(query) or [])
+            son_hata = None
+            if sonuc:
+                return sonuc, None
+            log.info("search_anime deneme %d/%d: boş sonuç", deneme, _SEARCH_RETRIES)
+        except Exception as exc:
+            son_hata = exc
+            log.warning("search_anime deneme %d/%d başarısız: %s",
+                        deneme, _SEARCH_RETRIES, exc)
+        if deneme < _SEARCH_RETRIES:
+            time.sleep(_SEARCH_BACKOFF_SECS * deneme)
+    return [], son_hata
+
+
+def _search_animedepo(query: str) -> list:
+    """AnimeDepo fallback araması.
+
+    Upstream `animedepo.Anime.arama_yap()` NotImplementedError atıyor; bu yüzden
+    çalışan `get_anime_listesi()` (dizin.json) üzerinden yerel alt-dize eşleşmesi
+    yapılır.
+    """
+    from turkanime_api import animedepo
+    mf = _manifest()
+    if mf.get("animedepo_url"):
+        animedepo.BASE_URL = mf["animedepo_url"]
+    q = (query or "").strip().casefold()
+    return [(slug, title) for slug, title in (animedepo.Anime.get_anime_listesi() or [])
+            if q in (title or "").casefold()]
+
+
+@mcp.tool()
+def search_anime(query: str) -> dict:
+    """TürkAnime'de anime ara (erişilemezse AnimeDepo'ya düşer).
+
+    Sonuçtaki `slug` değeri list_episodes ve download_episodes araçlarında
+    kullanılır. Kısa bir retry/backoff uygulanır; TürkAnime erişilemezse ve
+    manifest'te fallback tanımlıysa AnimeDepo dizininde aranır.
+
+    "Eşleşme yok" ile "siteye ulaşılamadı" AYRI raporlanır: erişim hatasında
+    `error` + `retryable: true` döner (tekrar denemek mantıklı), eşleşme
+    olmadığında boş `results` + `note` döner.
 
     Args:
         query: Aranacak anime adı (örn. "one piece").
 
     Returns:
-        [{"slug": ..., "title": ...}, ...] biçiminde liste.
+        Başarı: {"provider": "turkanime"|"animedepo", "results": [{"slug","title"}, ...]}
+        Eşleşme yok: {"provider": ..., "results": [], "note": "Eşleşme yok"}
+        Erişilemedi: {"error": "...", "retryable": true}
     """
     try:
-        ta = _get_ta()
-        results = ta.Anime.arama_yap(query)  # -> [(slug, title), ...]
-        return [{"slug": slug, "title": title} for slug, title in results]
+        if not (query or "").strip():
+            return {"provider": None, "results": [], "note": "Arama metni boş."}
+
+        feature = _search_feature()
+        fallback_adi = feature.get("fallback_provider")
+        zorla = bool(feature.get("force_fallback"))
+        ta_kullan = _provider_allowed("turkanime") and not zorla
+
+        sonuc: list = []
+        hata: Optional[Exception] = None
+        if ta_kullan:
+            sonuc, hata = _search_turkanime(query)
+            if sonuc:
+                return {"provider": "turkanime",
+                        "results": [{"slug": s, "title": t} for s, t in sonuc]}
+
+        # Buraya gelindiyse: TürkAnime kapalı / zorla fallback / boş / hatalı.
+        fb_uygun = bool(fallback_adi) and _provider_allowed(fallback_adi)
+        if fb_uygun and fallback_adi == "animedepo":
+            try:
+                fb_sonuc = _search_animedepo(query)
+            except Exception as fb_exc:
+                log.warning("AnimeDepo fallback başarısız: %s", fb_exc)
+                if hata is not None:
+                    return {"error": f"TürkAnime'ye ulaşılamadı ({hata}); "
+                                     f"AnimeDepo fallback da başarısız ({fb_exc}).",
+                            "retryable": True}
+            else:
+                if fb_sonuc:
+                    mesaj = (_manifest().get("messages") or {}).get("turkanime_offline")
+                    return {
+                        "provider": "animedepo",
+                        "results": [{"slug": s, "title": t} for s, t in fb_sonuc],
+                        "note": mesaj or "TürkAnime kullanılamadı, AnimeDepo kullanıldı.",
+                    }
+                if hata is None:
+                    return {"provider": "animedepo", "results": [],
+                            "note": "Eşleşme yok (TürkAnime ve AnimeDepo)."}
+
+        if hata is not None:
+            return {"error": f"TürkAnime'ye ulaşılamadı: {hata}", "retryable": True}
+        if not ta_kullan and not fb_uygun:
+            return {"error": "Kullanılabilir arama sağlayıcısı yok (manifest).",
+                    "retryable": False}
+        return {"provider": "turkanime" if ta_kullan else fallback_adi,
+                "results": [], "note": "Eşleşme yok"}
     except Exception as exc:
         log.exception("search_anime hatası")
-        return [{"error": f"Arama başarısız: {exc}"}]
+        return {"error": f"Arama başarısız: {exc}", "retryable": False}
 
 
 @mcp.tool()
