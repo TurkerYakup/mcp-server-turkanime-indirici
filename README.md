@@ -60,7 +60,12 @@ olarak açar. Kullanıcı sohbette isteğini yazar, Claude uygun aracı çağır
 | `download_episodes(anime_slug, episodes, …)` | Seçili bölümleri **arka planda** indirir | `{job_ids, target_dir, parallel, skipped, …}` |
 | `download_season(anime_slug, …)` | **Tüm sezonu** asenkron indirir | `{job_ids, target_dir, parallel, skipped, …}` |
 | `verify_library(anime_slug, …, repair?)` | Klasörü tarar: hangi bölüm **eksik/yarım**? `repair=True` ile onarır | `{ok:[…], partial:[…], missing:[…], queued_job_ids}` |
-| `check_new_episodes(anime_slug, auto_download?)` | **Yeni bölüm** yayınlanmış mı? İstersen hemen indirir | `{new_episodes:[…], previous_count, queued_job_ids}` |
+| `check_new_episodes(anime_slug, auto_download?)` | **Yeni bölüm** yayınlanmış mı? (slug karşılaştırmasıyla) İstersen hemen indirir | `{new_episodes:[…], previous_count, queued_job_ids}` |
+
+> `verify_library` ve `check_new_episodes` de `naming`/`season_number` alır — kütüphanen
+> `jellyfin` düzenindeyse onarım/otomatik indirmede de aynısını ver, yoksa klasörde karışık
+> adlandırma oluşur. Bu iki araca `max_workers` vermezsen sunucunun **mevcut** paralel ayarı
+> korunur (devam eden bir sezon indirmesi yavaşlatılmaz).
 
 Ortak indirme parametreleri: `output_dir`, `subfolder`, `fansub`, `max_resolution`, `rename`,
 `max_workers`, `resume`, `skip_existing`, `naming`, `season_number`.
@@ -173,14 +178,21 @@ download_season("horimiya", naming="jellyfin", season_number=1)
 
 İş kayıtları `<durum klasörü>/jobs.json` dosyasına yazılır (atomik: temp + `os.replace`):
 
-- **Ne zaman yazılır:** iş oluşturulduğunda, `status` değiştiğinde (anında) ve ara ilerleme
-  güncellemelerinde (`TURKANIME_STATE_FLUSH_SECS` ile debounce'lu — disk dövülmez).
+- **Ne zaman yazılır:** iş oluşturulduğunda ve **son duruma** (`finished`/`error`/`cancelled`)
+  geçişte anında; ara durumlar ile ilerleme güncellemeleri `TURKANIME_STATE_FLUSH_SECS` ile
+  debounce'lanır (1000+ bölümlük sezonda disk dövülmesin diye). Ara durumları kaybetmek
+  zararsızdır: restart'ta hepsi zaten `interrupted` işaretlenir.
 - **Açılışta:** önceki oturumun işleri geri yüklenir. Çalışır *görünen* işler (`downloading`,
   `queued`, `kaynak_araniyor`) **`interrupted`** işaretlenir — thread'leri artık olmadığından
   yanlışlıkla "hâlâ iniyor" gösterilmez.
 - `retry_job(job_id)` ile kesilen işler orijinal parametreleriyle yeniden kuyruğa alınır.
 - Durum klasörü: `TURKANIME_STATE_DIR` → yoksa `%PROGRAMDATA%\turkanime-mcp` → o da yoksa
   `~/.turkanime-mcp`.
+
+> **Aynı anda birden fazla sunucu örneği çalıştırıyorsan** (ör. Claude Desktop + zamanlanmış bir
+> `check_new_episodes` görevi) her birine ayrı bir `TURKANIME_STATE_DIR` verin. Örnekler aynı
+> `jobs.json`'ı paylaşırsa birbirinin iş kayıtlarını ezer ve diğerinin aktif işlerini
+> `interrupted` sanır.
 
 ---
 

@@ -155,6 +155,17 @@ _parallel_limit = _DEFAULT_PARALLEL
 _parallel_active = 0
 
 
+# "Mevcut paralel limiti DEĞİŞTİRME" işareti. `None` varsayılana (genelde 1)
+# sıfırladığından, retry_job/verify_library gibi araçlar devam eden bir sezonun
+# eşzamanlılığını sessizce düşürmemek için bunu kullanır.
+_KEEP_PARALLEL = object()
+
+
+def _current_parallel_limit() -> int:
+    with _PARALLEL_COND:
+        return _parallel_limit
+
+
 def _set_parallel_limit(n: Optional[int]) -> int:
     """Eşzamanlı indirme sınırını ayarlar (1.._WORKER_POOL_SIZE). None → varsayılan."""
     global _parallel_limit
@@ -308,7 +319,10 @@ def _write_state_file(payload: dict, seq: int) -> None:
             return  # daha yeni bir snapshot zaten yazılmış
         try:
             os.makedirs(_STATE_DIR, exist_ok=True)
-            tmp = _STATE_FILE + ".tmp"
+            # tmp adı sürece özeldir: aynı durum klasörünü paylaşan ikinci bir
+            # sunucu örneği (ör. zamanlanmış check_new_episodes görevi) aynı
+            # geçici dosyayı ezmesin.
+            tmp = f"{_STATE_FILE}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=1)
             os.replace(tmp, _STATE_FILE)
@@ -477,18 +491,23 @@ def _sanitize(name: str) -> str:
 def _job_set(jid: str, **fields: Any) -> None:
     """İş sözlüğünü thread-güvenli günceller ve durumu kalıcılaştırır.
 
-    `status` değişimi anında flush edilir (restart sonrası doğru durum için);
-    salt ilerleme (percent/speed/eta) güncellemeleri debounce'a tabidir.
+    Yalnızca SON durumlara (finished/error/cancelled) geçiş anında flush edilir.
+    Ara durumlar (queued/downloading/...) ve ilerleme güncellemeleri debounce'a
+    tabidir: bunları kaybetmek zararsızdır, çünkü restart'ta zaten hepsi
+    "interrupted" işaretlenir. Aksi halde 1000+ bölümlük bir sezonda her durum
+    geçişi tüm durum dosyasını yeniden yazdırırdı (O(N²) disk trafiği).
     """
     global _state_seq
     with _JOBS_LOCK:
         job = JOBS.get(jid)
         if job is None:
             return
-        status_degisti = "status" in fields and fields["status"] != job.get("status")
+        yeni_status = fields.get("status")
+        son_duruma_gecti = ("status" in fields and yeni_status != job.get("status")
+                            and yeni_status in _DONE_STATUSES)
         job.update(fields)
         _state_seq += 1
-    _persist_jobs(force=status_degisti)
+    _persist_jobs(force=son_duruma_gecti)
 
 
 def _get_anime(slug: str, refresh: bool = False):
@@ -690,19 +709,34 @@ def _partial_size(output_base: str, anime_slug: str, bolum: Any) -> int:
     return total
 
 
-def _cleanup_partials(output_base: str, anime_slug: str, bolum: Any) -> None:
-    """İptal sonrası yarım kalan .part / fragment dosyalarını temizler (best-effort)."""
+def _cleanup_partials(output_base: str, anime_slug: str, bolum: Any,
+                      only_partial: bool = False) -> None:
+    """Bölüme ait dosyaları temizler (best-effort).
+
+    Args:
+        only_partial: True ise YALNIZCA yarım dosyalar (.part/.ytdl/.part-Frag)
+            silinir; tamamlanmış dosyalara dokunulmaz. False (iptal/hata sonrası)
+            ise bölüm slug'ıyla başlayan her şey silinir — yarım kalan indirmenin
+            son dosyası da (henüz .part'a düşmemiş olabilir) gitmelidir.
+
+    DİKKAT: only_partial=False, `rename=False` ile inmiş TAMAMLANMIŞ bir dosyayı
+    da siler (o düzende dosya adı da slug ile başlar). Bu yüzden iş başlangıcında
+    yalnızca only_partial=True kullanılır.
+    """
     try:
         folder = os.path.join(output_base, anime_slug)
         if not os.path.isdir(folder):
             return
         prefix = getattr(bolum, "slug", "")
         for name in os.listdir(folder):
-            if prefix and name.startswith(prefix):
-                try:
-                    os.remove(os.path.join(folder, name))
-                except OSError:
-                    pass
+            if not prefix or not name.startswith(prefix):
+                continue
+            if only_partial and not _strip_temp_suffix(name)[1]:
+                continue
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
         try:
             os.rmdir(folder)  # boşsa kaldır
         except OSError:
@@ -969,22 +1003,31 @@ def _download_task(
             # İptal istendiyse hook'tan exception fırlat → yt-dlp indirmeyi durdurur.
             if _is_cancelled(jid):
                 raise _Cancelled()
-            # yt-dlp progress_hooks callback'i
+            # yt-dlp progress_hooks callback'i.
+            # DİKKAT: yt-dlp'nin "finished"i BU DOSYANIN/parçanın bittiğini söyler,
+            # işin tamamlandığını DEĞİL (ignoreerrors ile eksik kalmış olabilir).
+            # Bu yüzden işi burada "finished" İŞARETLEMEYİZ — o karar yalnızca
+            # _download_complete diskten doğruladıktan sonra verilir. Aksi halde
+            # eksik bir indirme kalıcı duruma "finished" yazılıp restart sonrası
+            # interrupted işaretlenmez ve yanlış "bitti" gösterilirdi.
             _job_set(
                 jid,
-                status=d.get("status"),
+                status="downloading",
+                dl_status=d.get("status"),
                 percent=(d.get("_percent_str") or "").strip() or None,
                 speed=(d.get("_speed_str") or "").strip() or None,
                 eta=d.get("eta"),
                 file=d.get("filename"),
             )
 
-        # ÖNCEKİ oturumdan/işten kalmış yarım dosyaları sil. yt-dlp'nin
+        # ÖNCEKİ oturumdan/işten kalmış YARIM dosyaları sil. yt-dlp'nin
         # `continuedl` varsayılanı True olduğundan, farklı bir player'dan kalmış
         # bir `.part` sessizce "devam" ettirilir ve BOZUK dosya üretirdi (outtmpl
         # bölüm bazlı, kaynak bazlı değil). Resume yalnızca aynı player'da,
         # aşağıdaki döngü içinde güvenlidir.
-        _cleanup_partials(output_base, anime_slug, bolum)
+        # only_partial=True ŞART: aksi halde `rename=False` düzeninde daha önce
+        # TAMAMLANMIŞ dosya da silinir ve indirme başarısız olursa veri kaybolur.
+        _cleanup_partials(output_base, anime_slug, bolum, only_partial=True)
 
         # Kaynak akışı yarıda kesilebildiği için birden fazla player denenir;
         # başarısız olan player sonraki denemede hariç tutulur.
@@ -1196,15 +1239,13 @@ def search_anime(query: str) -> dict:
 
         # Buraya gelindiyse: TürkAnime kapalı / zorla fallback / boş / hatalı.
         fb_uygun = bool(fallback_adi) and _provider_allowed(fallback_adi)
+        fb_hata: Optional[Exception] = None
         if fb_uygun and fallback_adi == "animedepo":
             try:
                 fb_sonuc = _search_animedepo(query)
-            except Exception as fb_exc:
-                log.warning("AnimeDepo fallback başarısız: %s", fb_exc)
-                if hata is not None:
-                    return {"error": f"TürkAnime'ye ulaşılamadı ({hata}); "
-                                     f"AnimeDepo fallback da başarısız ({fb_exc}).",
-                            "retryable": True}
+            except Exception as exc:
+                fb_hata = exc
+                log.warning("AnimeDepo fallback başarısız: %s", exc)
             else:
                 if fb_sonuc:
                     mesaj = (_manifest().get("messages") or {}).get("turkanime_offline")
@@ -1214,11 +1255,19 @@ def search_anime(query: str) -> dict:
                         "note": mesaj or "TürkAnime kullanılamadı, AnimeDepo kullanıldı.",
                     }
                 if hata is None:
+                    # Her iki sağlayıcıya da ULAŞILDI ve eşleşme yok.
                     return {"provider": "animedepo", "results": [],
                             "note": "Eşleşme yok (TürkAnime ve AnimeDepo)."}
 
-        if hata is not None:
-            return {"error": f"TürkAnime'ye ulaşılamadı: {hata}", "retryable": True}
+        # Sonuç yok. Sebebi ayırt et: sağlayıcılardan biri ERİŞİLEMEDİYSE bu bir
+        # "eşleşme yok" DEĞİLDİR — kullanıcıya "böyle anime yok" demek yanlış olur.
+        if hata is not None or fb_hata is not None:
+            parcalar = []
+            if hata is not None:
+                parcalar.append(f"TürkAnime'ye ulaşılamadı: {hata}")
+            if fb_hata is not None:
+                parcalar.append(f"AnimeDepo'ya ulaşılamadı: {fb_hata}")
+            return {"error": " | ".join(parcalar), "retryable": True}
         if not ta_kullan and not fb_uygun:
             return {"error": "Kullanılabilir arama sağlayıcısı yok (manifest).",
                     "retryable": False}
@@ -1276,9 +1325,14 @@ def _start_downloads(
     naming: str = "default",
     season_number: int = 1,
 ) -> dict:
-    """İndirme işlerini kuran çekirdek mantık (araçlar bunu çağırır)."""
+    """İndirme işlerini kuran çekirdek mantık (araçlar bunu çağırır).
+
+    `max_workers=_KEEP_PARALLEL` verilirse sunucu genelindeki eşzamanlılık
+    sınırına DOKUNULMAZ (devam eden indirmeleri yavaşlatmamak için).
+    """
     # Eşzamanlı indirme sınırını bu çağrıya göre ayarla (None → varsayılan=1).
-    parallel = _set_parallel_limit(max_workers)
+    parallel = (_current_parallel_limit() if max_workers is _KEEP_PARALLEL
+                else _set_parallel_limit(max_workers))
 
     anime = _get_anime(anime_slug)
     anime_title = getattr(anime, "title", anime_slug)
@@ -1651,7 +1705,7 @@ def retry_job(job_id: str) -> dict:
             params.get("fansub"),
             bool(params.get("max_resolution", True)),
             bool(params.get("rename", True)),
-            None,                            # paralel limiti değiştirme
+            _KEEP_PARALLEL,                  # devam eden indirmelerin hızını düşürme
             bool(params.get("resume", True)),
             False,                           # skip_existing: yeniden denemenin amacı bu
             params.get("naming", "default"),
@@ -1796,6 +1850,8 @@ def verify_library(
     fansub: Optional[str] = None,
     max_resolution: bool = True,
     max_workers: Optional[int] = None,
+    naming: str = "default",
+    season_number: int = 1,
 ) -> dict:
     """Bir animenin indirme klasörünü doğrula: hangi bölümler eksik/yarım?
 
@@ -1817,7 +1873,12 @@ def verify_library(
         repair: True ise eksik/yarım bölümleri kuyruğa alır. False = sadece rapor.
         fansub: Onarım indirmelerinde tercih edilen fansub (None = filtre yok).
         max_resolution: Onarım indirmelerinde en yüksek çözünürlüğü tercih et.
-        max_workers: Onarım indirmelerinde paralel iş sayısı.
+        max_workers: Onarım indirmelerinde paralel iş sayısı. Verilmezse sunucunun
+            mevcut ayarı korunur (devam eden indirmeler yavaşlatılmaz).
+        naming: Onarım indirmelerinin adlandırma düzeni — kütüphanen jellyfin
+            düzenindeyse "jellyfin" ver, yoksa onarılan bölüm "default" düzende
+            inip klasörde karışık adlandırma bırakır.
+        season_number: naming="jellyfin" için sezon numarası.
 
     Returns:
         {"anime", "target_dir", "total_episodes", "ok":[...], "partial":[...],
@@ -1853,7 +1914,9 @@ def verify_library(
 
         started = _start_downloads(
             anime_slug, bozuk, output_dir, subfolder,
-            fansub, max_resolution, True, max_workers,
+            fansub, max_resolution, True,
+            max_workers if max_workers is not None else _KEEP_PARALLEL,
+            True, False, naming, season_number,
         )
         result["queued_job_ids"] = started.get("job_ids", [])
         result["queued"] = started.get("queued", 0)
@@ -1973,12 +2036,14 @@ def check_new_episodes(
     fansub: Optional[str] = None,
     max_resolution: bool = True,
     max_workers: Optional[int] = None,
+    naming: str = "default",
+    season_number: int = 1,
 ) -> dict:
     """Bir animede yeni bölüm yayınlanmış mı diye bak (ve istersen hemen indir).
 
-    Taze bölüm listesini çeker (önbelleği atlar) ve kalıcı durumdaki "en son
-    bilinen bölüm sayısı" ile karşılaştırır. Zamanlanmış bir göreve bağlayarak
-    simulcast'ları otomatikleştirebilirsin.
+    Taze bölüm listesini çeker (önbelleği atlar) ve kalıcı durumda kayıtlı
+    "en son görülen bölüm slug'ları" ile karşılaştırır. Zamanlanmış bir göreve
+    bağlayarak simulcast'ları otomatikleştirebilirsin.
 
     İLK çağrıda karşılaştırılacak bir kayıt olmadığından yeni bölüm bildirilmez;
     yalnızca mevcut sayı temel (baseline) olarak kaydedilir — aksi halde tüm
@@ -1991,7 +2056,10 @@ def check_new_episodes(
         subfolder: Sezon alt klasörü (verilmezse başlıktan türetilir).
         fansub: Tercih edilen fansub (auto_download için).
         max_resolution: En yüksek çözünürlüğü tercih et (auto_download için).
-        max_workers: Paralel iş sayısı (auto_download için).
+        max_workers: Paralel iş sayısı (auto_download için). Verilmezse sunucunun
+            mevcut ayarı korunur (devam eden indirmeler yavaşlatılmaz).
+        naming: Adlandırma düzeni ("default"|"jellyfin") — kütüphanenle aynı olmalı.
+        season_number: naming="jellyfin" için sezon numarası.
 
     Returns:
         {"anime", "episode_count", "previous_count", "first_check",
@@ -2006,11 +2074,20 @@ def check_new_episodes(
 
         onceki_kayit = _series_get(anime_slug)
         onceki = onceki_kayit.get("episode_count")
+        onceki_sluglar = set(onceki_kayit.get("slugs") or [])
         ilk_kontrol = onceki is None
 
+        # Yeni bölümü SLUG'a göre bul, sayıya göre değil: site araya bölüm
+        # ekleyip/çıkarabildiğinden (OVA, özel bölüm) salt sayı farkı yanlış
+        # bölümleri "yeni" gösterir ve auto_download YANLIŞ bölümü indirirdi.
         yeni_indexler: list[int] = []
-        if not ilk_kontrol and toplam > int(onceki):
-            yeni_indexler = list(range(int(onceki), toplam))
+        if not ilk_kontrol:
+            if onceki_sluglar:
+                yeni_indexler = [i for i, b in enumerate(bolumler)
+                                 if getattr(b, "slug", None) not in onceki_sluglar]
+            elif toplam > int(onceki):
+                # Slug'ların kaydedilmediği eski durum dosyası — sayıya düş.
+                yeni_indexler = list(range(int(onceki), toplam))
 
         yeni = [{"index": i,
                  "episode": int(_episode_number(bolumler[i], i)),
@@ -2019,6 +2096,7 @@ def check_new_episodes(
                 for i in yeni_indexler]
 
         _series_set(anime_slug, title=anime_title, episode_count=toplam,
+                    slugs=[getattr(b, "slug", None) for b in bolumler],
                     last_checked=time.strftime("%Y-%m-%d %H:%M:%S"))
 
         sonuc: dict[str, Any] = {
@@ -2041,7 +2119,9 @@ def check_new_episodes(
         if auto_download:
             started = _start_downloads(
                 anime_slug, yeni_indexler, output_dir, subfolder,
-                fansub, max_resolution, True, max_workers,
+                fansub, max_resolution, True,
+                max_workers if max_workers is not None else _KEEP_PARALLEL,
+                True, False, naming, season_number,
             )
             sonuc["downloaded"] = True
             sonuc["queued_job_ids"] = started.get("job_ids", [])
