@@ -191,6 +191,12 @@ _MAX_SOURCE_ATTEMPTS = max(1, int(os.environ.get("TURKANIME_SOURCE_ATTEMPTS", "3
 # kabul edilir. verify_library ve skip_existing bu eşiği kullanır.
 _MIN_VALID_BYTES = max(0, int(os.environ.get("TURKANIME_MIN_VALID_BYTES", str(1024 * 1024))))
 
+# Bir kaynak akışı yarıda kestiğinde AYNI player'da kaldığı yerden devam etmek
+# için yapılacak deneme sayısı. Her denemeden sonra `.part` büyümediyse devam
+# etmenin faydası yok — partial temizlenip farklı kaynağa geçilir. 0 = resume
+# kapalı (her zaman baştan indir).
+_RESUME_ATTEMPTS = max(0, int(os.environ.get("TURKANIME_RESUME_ATTEMPTS", "1")))
+
 # job_id -> iş bilgisi dict'i
 JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
@@ -527,6 +533,31 @@ def _finalize_file(
         log.warning("[%s] dosya taşınamadı/adlandırılamadı: %s", jid, exc)
 
 
+def _partial_size(output_base: str, anime_slug: str, bolum: Any) -> int:
+    """Bölümün yarım (.part/.ytdl) dosyalarının toplam boyutu (bayt).
+
+    Resume'un işe yarayıp yaramadığını ölçmek için: iki deneme arasında bu değer
+    artmıyorsa devam etmenin faydası yoktur, kaynak değiştirmek gerekir.
+    """
+    folder = os.path.join(output_base, anime_slug)
+    if not os.path.isdir(folder):
+        return 0
+    prefix = getattr(bolum, "slug", "") or ""
+    total = 0
+    try:
+        for name in os.listdir(folder):
+            if prefix and not name.startswith(prefix):
+                continue
+            if name.endswith(".part") or name.endswith(".ytdl") or ".part-" in name:
+                try:
+                    total += os.path.getsize(os.path.join(folder, name))
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
 def _cleanup_partials(output_base: str, anime_slug: str, bolum: Any) -> None:
     """İptal sonrası yarım kalan .part / fragment dosyalarını temizler (best-effort)."""
     try:
@@ -765,6 +796,7 @@ def _download_task(
     fansub: Optional[str],
     max_resolution: bool,
     rename: bool,
+    resume: bool = True,
 ) -> None:
     """Tek bir bölümü indiren arka plan işi (thread havuzunda çalışır)."""
     slot_held = False
@@ -808,6 +840,13 @@ def _download_task(
                 file=d.get("filename"),
             )
 
+        # ÖNCEKİ oturumdan/işten kalmış yarım dosyaları sil. yt-dlp'nin
+        # `continuedl` varsayılanı True olduğundan, farklı bir player'dan kalmış
+        # bir `.part` sessizce "devam" ettirilir ve BOZUK dosya üretirdi (outtmpl
+        # bölüm bazlı, kaynak bazlı değil). Resume yalnızca aynı player'da,
+        # aşağıdaki döngü içinde güvenlidir.
+        _cleanup_partials(output_base, anime_slug, bolum)
+
         # Kaynak akışı yarıda kesilebildiği için birden fazla player denenir;
         # başarısız olan player sonraki denemede hariç tutulur.
         tried_players: list = []
@@ -844,9 +883,17 @@ def _download_task(
                 percent=None, speed=None, eta=None, error=None,
             )
 
-            # Kopan bağlantıya karşı biraz daha dayanıklılık.
+            # Kopan bağlantıya karşı biraz daha dayanıklılık + kaldığı yerden
+            # devam (`continuedl`). `part=True` yarım veriyi .part dosyasında
+            # tutar; resume ancak bu dosya korunursa mümkün.
             try:
-                video.ydl_opts = {**video.ydl_opts, "retries": 15, "fragment_retries": 20}
+                video.ydl_opts = {
+                    **video.ydl_opts,
+                    "retries": 15,
+                    "fragment_retries": 20,
+                    "continuedl": bool(resume),
+                    "part": True,
+                }
             except Exception:  # pragma: no cover
                 pass
 
@@ -859,7 +906,32 @@ def _download_task(
 
             # yt-dlp ignoreerrors yüzünden yarıda kesilse de hatasız döner:
             # diske bakıp GERÇEKTEN bitti mi kontrol et.
-            if _download_complete(output_base, anime_slug, bolum):
+            tamamlandi = _download_complete(output_base, anime_slug, bolum)
+
+            # Eksik kaldıysa: kaynağı değiştirmeden önce AYNI player'da kaldığı
+            # yerden devam etmeyi dene (bant genişliği israfını önler). Farklı
+            # player = farklı URL olduğundan resume yalnızca burada anlamlıdır.
+            r = 0
+            while (not tamamlandi and resume and r < _RESUME_ATTEMPTS
+                   and not _is_cancelled(jid)):
+                r += 1
+                onceki = _partial_size(output_base, anime_slug, bolum)
+                if onceki <= 0:
+                    break  # devam edilecek yarım dosya yok
+                _job_set(jid, status="downloading",
+                         source_status="kaldığı yerden devam ediliyor")
+                log.info("[%s] resume %d/%d (player=%s, %d bayt mevcut): %s",
+                         jid, r, _RESUME_ATTEMPTS, player, onceki, bolum.slug)
+                video.indir(callback=hook, output=output_base)
+                tamamlandi = _download_complete(output_base, anime_slug, bolum)
+                if tamamlandi:
+                    break
+                if _partial_size(output_base, anime_slug, bolum) <= onceki:
+                    log.info("[%s] resume ilerlemedi; kaynak değiştirilecek: %s",
+                             jid, bolum.slug)
+                    break
+
+            if tamamlandi:
                 _job_set(jid, status="finished", error=None)
                 if rename:
                     _finalize_file(jid, output_base, season_folder, bolum, pos)
@@ -867,6 +939,7 @@ def _download_task(
                 return
 
             # Eksik indirme: yarım dosyayı temizle, farklı kaynağı dene.
+            # (Farklı kaynağın URL'si başka olacağından yarım veri kullanılamaz.)
             last_error = f"'{player}' kaynağı akışı yarıda kesti (eksik indirme)."
             log.warning("[%s] deneme %d eksik kaldı (player=%s), sıradaki kaynak denenecek: %s",
                         jid, attempt, player, bolum.slug)
@@ -967,6 +1040,7 @@ def _start_downloads(
     max_resolution: bool,
     rename: bool,
     max_workers: Optional[int] = None,
+    resume: bool = True,
 ) -> dict:
     """İndirme işlerini kuran çekirdek mantık (araçlar bunu çağırır)."""
     # Eşzamanlı indirme sınırını bu çağrıya göre ayarla (None → varsayılan=1).
@@ -1012,7 +1086,7 @@ def _start_downloads(
         _EXECUTOR.submit(
             _download_task,
             jid, anime_slug, anime_title, bolum, pos,
-            output_base, season_folder, fansub, max_resolution, rename,
+            output_base, season_folder, fansub, max_resolution, rename, resume,
         )
         jobs_out.append({"job_id": jid, "anime": anime_title, "bolum": bolum.title})
 
@@ -1022,6 +1096,7 @@ def _start_downloads(
         "target_dir": season_dir,
         "queued": len(jobs_out),
         "parallel": parallel,
+        "resume": bool(resume),
         "jobs": jobs_out,
         "job_ids": [j["job_id"] for j in jobs_out],
     }
@@ -1037,6 +1112,7 @@ def download_episodes(
     max_resolution: bool = True,
     rename: bool = True,
     max_workers: Optional[int] = None,
+    resume: bool = True,
 ) -> dict:
     """Bir animenin belirtilen bölümlerini ARKA PLANDA indir.
 
@@ -1068,14 +1144,18 @@ def download_episodes(
         max_workers: Aynı anda kaç bölümün paralel ineceği. Verilmezse varsayılan
             1 (tek tek). Örn. 3 verirsen 3 bölüm aynı anda iner. Bu değer sunucu
             genelindeki eşzamanlılık sınırını ayarlar (son çağrı geçerlidir).
+        resume: True (varsayılan) ise bir kaynak akışı yarıda keserse aynı
+            kaynakta kaldığı yerden devam etmeye çalışır; ilerleme olmazsa yarım
+            dosyayı silip farklı bir kaynağa geçer. False = her seferinde baştan.
 
     Returns:
-        {"output_dir", "target_dir", "queued", "parallel", "jobs":[...], "job_ids":[...]}
+        {"output_dir", "target_dir", "queued", "parallel", "resume",
+         "jobs":[...], "job_ids":[...]}
     """
     try:
         return _start_downloads(
             anime_slug, episodes, output_dir, subfolder,
-            fansub, max_resolution, rename, max_workers,
+            fansub, max_resolution, rename, max_workers, resume,
         )
     except Exception as exc:
         log.exception("download_episodes hatası")
@@ -1091,6 +1171,7 @@ def download_season(
     max_resolution: bool = True,
     rename: bool = True,
     max_workers: Optional[int] = None,
+    resume: bool = True,
 ) -> dict:
     """Bir animenin (sezonun) TÜM bölümlerini ARKA PLANDA, asenkron indir.
 
@@ -1108,14 +1189,17 @@ def download_season(
         rename: True ise düzenli adlandırma + alt klasöre taşıma.
         max_workers: Aynı anda kaç bölümün paralel ineceği. Verilmezse varsayılan
             1 (tek tek). Örn. 3 → 3 bölüm aynı anda.
+        resume: True (varsayılan) ise yarıda kesilen indirmeyi aynı kaynakta
+            kaldığı yerden devam ettirmeye çalışır (bkz. download_episodes).
 
     Returns:
-        {"output_dir", "target_dir", "queued", "parallel", "jobs":[...], "job_ids":[...]}
+        {"output_dir", "target_dir", "queued", "parallel", "resume",
+         "jobs":[...], "job_ids":[...]}
     """
     try:
         return _start_downloads(
             anime_slug, "all", output_dir, subfolder,
-            fansub, max_resolution, rename, max_workers,
+            fansub, max_resolution, rename, max_workers, resume,
         )
     except Exception as exc:
         log.exception("download_season hatası")
