@@ -31,6 +31,7 @@ olarak açar. Kullanıcı sohbette isteğini yazar, Claude uygun aracı çağır
 
 - ⚙️ **Selenium/webdriver gerektirmez** — Cloudflare bypass `curl_cffi` (Firefox TLS impersonation) ile.
 - 🎞️ İndirme motoru **yt-dlp**; şifreli video URL'leri `pycryptodome` ile çözülür.
+- 📦 **ffmpeg otomatik gelir** — `pip install` yeterli; ayrıca kurulum/yönetici izni gerekmez.
 - 🧵 İndirmeler **arka planda** sürer; kaç bölümün **paralel** ineceğini seçebilirsin (`max_workers`, varsayılan tek tek).
 - 🔁 **Güvenilir tamamlanma:** yarıda kesilen indirme "bitti" sanılmaz — diske bakılıp doğrulanır,
   önce **kaldığı yerden devam** edilir, olmazsa **farklı bir kaynak** denenir. Kararsız **BETA**
@@ -216,15 +217,32 @@ pip install .
 > ihtiyaç duyar; bu `pywin32` ile gelir ve `requirements.txt` içindedir. Gerekirse:
 > `python -m pywin32_postinstall -install`.
 
-### ffmpeg (önerilir)
+### ffmpeg — ek adım gerekmez
 
-Bazı formatların (ayrı video/ses parçaları) birleştirilmesi için:
+Ayrı video/ses parçalı bölümlerin birleştirilmesi için `ffmpeg` gerekir.
+**Yukarıdaki `pip install` bunu otomatik getirir** (`imageio-ffmpeg` paketi) —
+ayrıca bir şey kurmanıza, yönetici izni almanıza gerek yok.
+
+Sunucu ffmpeg'i şu sırayla arar:
+
+| # | Kaynak | Not |
+|---|--------|-----|
+| 1 | `TURKANIME_FFMPEG` | Elle verdiğiniz tam yol |
+| 2 | `PATH`'teki `ffmpeg` | **Tercih edilen** — yanında `ffprobe` de gelir |
+| 3 | `imageio-ffmpeg` paketi | Otomatik yedek; `pip install` ile gelir |
+
+Hangisinin kullanıldığını `health_check` söyler.
+
+**Sistem kurulumu (önerilir, zorunlu değil):**
 
 ```powershell
 winget install Gyan.FFmpeg
 ```
 
-`ffmpeg`'in `PATH`'te olduğundan emin olun (`ffmpeg -version`).
+Kurduktan sonra terminali/Claude Desktop'ı yeniden başlatın (`PATH` yenilensin).
+Sistem kurulumu `ffprobe`'u da getirdiği için tercih edilir; yedek paket yalnızca
+`ffmpeg` içerir — birleştirme (m3u8 dahil) yine çalışır, çünkü yt-dlp ses codec
+tespitinde `ffmpeg`'e düşer.
 
 ---
 
@@ -271,6 +289,7 @@ Kaydedip Claude Desktop'ı **tamamen kapatıp yeniden açın** (tepsiden Quit). 
 | `TURKANIME_SEARCH_RETRIES` | `2` | `search_anime` deneme sayısı (boş sonuç da yeniden denenir) |
 | `TURKANIME_SEARCH_BACKOFF` | `0.5` | Arama denemeleri arası bekleme temeli (saniye): 0.5s, 1.0s, … |
 | `TURKANIME_MANIFEST` | *(otomatik)* | `manifest.json` yolu; verilmezse depodaki kopya okunur |
+| `TURKANIME_FFMPEG` | *(otomatik)* | `ffmpeg` ikilisinin tam yolu; verilmezse PATH → `imageio-ffmpeg` sırasıyla aranır |
 | `CURL_CA_BUNDLE` | *(otomatik)* | ASCII CA sertifika yolu (sunucu gerekirse kendi ayarlar) |
 
 ---
@@ -302,6 +321,11 @@ kullanıldığını söyler).
 
 **Bölümler eksik/yarım kalmış** → `verify_library("<slug>")` ile durumu görün
 (`ok`/`partial`/`missing`), `repair=True` ile onarın. Eşiği `TURKANIME_MIN_VALID_BYTES` ayarlar.
+
+**Ses yok / birleştirme hatası** → `health_check`'te `ffmpeg` satırına bakın. `uyarı` diyorsa
+`pip install -r requirements.txt` (otomatik yedeği getirir) ya da `winget install Gyan.FFmpeg`
+çalıştırıp Claude Desktop'ı yeniden başlatın. Kendi derlemenizi kullanmak isterseniz config'e
+`"TURKANIME_FFMPEG": "D:\\ffmpeg\\bin\\ffmpeg.exe"` ekleyin.
 
 **Restart sonrası işler kayboluyor** → Kaybolmaz: `jobs.json`'a yazılır. `download_status()`
 önceki oturumun işlerini de gösterir; yarıda kalanlar `interrupted`'tır ve `retry_job` ile

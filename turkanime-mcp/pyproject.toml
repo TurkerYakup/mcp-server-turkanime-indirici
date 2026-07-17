@@ -15,6 +15,9 @@ keywords = ["mcp", "turkanime", "anime", "yt-dlp", "claude"]
 dependencies = [
     "mcp>=1.2.0",
     "turkanime-cli>=10.0.3",
+    # ffmpeg yedeği: PATH'te sistem ffmpeg'i yoksa birleştirme bununla yapılır
+    # (kurulum sırasında otomatik gelir; winget/yönetici izni gerekmez).
+    "imageio-ffmpeg>=0.4.9",
     "pywin32>=306 ; sys_platform == 'win32'",
 ]
 

@@ -472,6 +472,65 @@ def _search_feature() -> dict:
     return (_manifest().get("features") or {}).get("search") or {}
 
 
+# --------------------------------------------------------------------------- #
+# ffmpeg çözümü: ayrı video/ses parçalarını birleştirmek için gerekir.
+# --------------------------------------------------------------------------- #
+_FFMPEG_CACHE: Optional[tuple] = None
+_FFMPEG_LOCK = threading.Lock()
+
+
+def _resolve_ffmpeg() -> tuple[Optional[str], str]:
+    """ffmpeg ikilisini bulur -> (yol, kaynak).
+
+    kaynak: "env" | "path" | "imageio" | "yok"
+
+    Öncelik:
+      1. TURKANIME_FFMPEG — elle verilen tam yol.
+      2. PATH'teki ffmpeg — sistem kurulumu (winget/choco). Yanında ffprobe de
+         geldiğinden TERCİH EDİLENDİR.
+      3. imageio-ffmpeg paketiyle gelen ikili — `pip install -r requirements.txt`
+         ile OTOMATİK gelir; yönetici izni ya da winget gerekmez. ffprobe
+         İÇERMEZ; ancak yt-dlp ses codec tespitinde ffmpeg'e düştüğünden
+         birleştirme (m3u8 dahil) çalışır.
+
+    Sonuç önbelleğe alınır: her indirmede diske/PATH'e bakılmaz.
+    """
+    global _FFMPEG_CACHE
+    with _FFMPEG_LOCK:
+        if _FFMPEG_CACHE is not None:
+            return _FFMPEG_CACHE
+        yol: Optional[str] = None
+        kaynak = "yok"
+        ozel = os.environ.get("TURKANIME_FFMPEG", "").strip()
+        if ozel and os.path.isfile(ozel):
+            yol, kaynak = ozel, "env"
+        elif shutil.which("ffmpeg"):
+            yol, kaynak = shutil.which("ffmpeg"), "path"
+        else:
+            try:
+                import imageio_ffmpeg
+                aday = imageio_ffmpeg.get_ffmpeg_exe()
+                if aday and os.path.isfile(aday):
+                    yol, kaynak = aday, "imageio"
+            except Exception as exc:
+                log.debug("imageio-ffmpeg kullanılamadı: %s", exc)
+        _FFMPEG_CACHE = (yol, kaynak)
+        return _FFMPEG_CACHE
+
+
+def _ffmpeg_ydl_opts() -> dict:
+    """yt-dlp'ye ffmpeg'i tarif eden ek seçenekler.
+
+    PATH'te ffmpeg varsa yt-dlp onu zaten kendi bulur (ve ffprobe'u da aynı
+    klasörde arar) — bu durumda karışmayız. Yalnızca PATH DIŞI bir ikili
+    kullanıyorsak `ffmpeg_location` veririz.
+    """
+    yol, kaynak = _resolve_ffmpeg()
+    if yol and kaynak in ("env", "imageio"):
+        return {"ffmpeg_location": yol}
+    return {}
+
+
 mcp = FastMCP("turkanime")
 
 
@@ -1075,6 +1134,9 @@ def _download_task(
                     "fragment_retries": 20,
                     "continuedl": bool(resume),
                     "part": True,
+                    # PATH'te ffmpeg yoksa paketle gelen ikiliyi göster; aksi
+                    # halde ayrı video/ses parçalı bölümler birleştirilemez.
+                    **_ffmpeg_ydl_opts(),
                 }
             except Exception:  # pragma: no cover
                 pass
@@ -1965,13 +2027,21 @@ def health_check() -> dict:
         ekle("turkanime.tv", "hata", "turkanime_api yok; kontrol edilemedi.")
 
     # 3) ffmpeg
-    ff = shutil.which("ffmpeg")
-    if ff:
-        ekle("ffmpeg", "ok", ff)
+    ff_yol, ff_kaynak = _resolve_ffmpeg()
+    if ff_kaynak == "path":
+        ekle("ffmpeg", "ok", f"{ff_yol} (PATH — sistem kurulumu, ffprobe dahil)")
+    elif ff_kaynak == "env":
+        ekle("ffmpeg", "ok", f"{ff_yol} (TURKANIME_FFMPEG)")
+    elif ff_kaynak == "imageio":
+        ekle("ffmpeg", "ok",
+             f"{ff_yol} (imageio-ffmpeg paketi — otomatik yedek. Birleştirme "
+             "çalışır; ffprobe içermez. Sistem kurulumu için: "
+             "winget install Gyan.FFmpeg)")
     else:
         ekle("ffmpeg", "uyarı",
-             "PATH'te yok — ayrı video/ses parçalarının birleştirilmesi "
-             "başarısız olabilir. Kurulum: winget install Gyan.FFmpeg")
+             "Bulunamadı — ayrı video/ses parçalarının birleştirilmesi başarısız "
+             "olur. Çözüm: pip install -r requirements.txt (otomatik yedek) ya da "
+             "winget install Gyan.FFmpeg (önerilen).")
 
     # 4) İndirme klasörü
     try:
@@ -2142,10 +2212,14 @@ def main() -> None:
     # Önceki oturumun iş geçmişini geri yükle (yarıda kalanlar interrupted olur).
     log.info("Durum dosyası: %s", _STATE_FILE)
     _load_state()
-    # ffmpeg bazı formatların birleştirilmesi için gereklidir; yoksa uyar.
-    if shutil.which("ffmpeg") is None:
-        log.warning("ffmpeg PATH'te bulunamadı — bazı bölümlerin ses/video "
-                    "birleştirmesi başarısız olabilir. Kurulum: winget install Gyan.FFmpeg")
+    # ffmpeg bazı formatların birleştirilmesi için gereklidir.
+    ff_yol, ff_kaynak = _resolve_ffmpeg()
+    if ff_kaynak == "yok":
+        log.warning("ffmpeg bulunamadı — bazı bölümlerin ses/video birleştirmesi "
+                    "başarısız olur. Çözüm: pip install -r requirements.txt "
+                    "(otomatik yedek) ya da winget install Gyan.FFmpeg (önerilen).")
+    else:
+        log.info("ffmpeg: %s (kaynak: %s)", ff_yol, ff_kaynak)
     mcp.run()  # varsayılan transport: stdio
 
 

@@ -7,5 +7,12 @@ mcp>=1.2.0
 # TürkAnime API + indirme motoru (yt-dlp, curl-cffi, pycryptodome dahil gelir)
 turkanime-cli>=10.0.4
 
+# ffmpeg YEDEĞİ: ayrı video/ses parçalı bölümleri birleştirmek için ffmpeg şart.
+# Bu paket ffmpeg ikilisini beraberinde getirir; böylece depoyu kuran birinin
+# ayrıca winget/choco çalıştırmasına ya da yönetici izni almasına gerek kalmaz.
+# Sunucu önce PATH'teki sistem ffmpeg'ini arar (ffprobe de geldiği için tercih
+# edilir), yoksa bu pakete düşer. Sistem kurulumu için: winget install Gyan.FFmpeg
+imageio-ffmpeg>=0.4.9
+
 # Windows: mcp'nin stdio katmanı pywintypes'a ihtiyaç duyar (pywin32 ile gelir)
 pywin32>=306 ; sys_platform == "win32"
