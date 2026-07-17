@@ -250,6 +250,12 @@ _state_last_flush = 0.0   # _STATE_LOCK altında
 _state_written_seq = 0    # _STATE_LOCK altında — eski snapshot'ın yenisini ezmesini önler
 _state_seq = 0            # _JOBS_LOCK altında — her değişiklikte artar
 
+# slug -> {"title", "episode_count", "last_checked"} — check_new_episodes'un
+# "en son kaç bölüm görmüştüm" hafızası. Kendi kilidi vardır; _SERIES_LOCK ile
+# _JOBS_LOCK asla İÇ İÇE alınmaz (bkz. _snapshot_state).
+_SERIES: dict[str, dict] = {}
+_SERIES_LOCK = threading.Lock()
+
 
 def _bump_state_seq_locked() -> None:
     """Durum sıra numarasını artırır. ÇAĞIRAN _JOBS_LOCK'u tutuyor olmalı."""
@@ -257,19 +263,31 @@ def _bump_state_seq_locked() -> None:
     _state_seq += 1
 
 
-def _snapshot_jobs() -> tuple[dict, int]:
-    """JOBS'un JSON'a yazılabilir kopyasını + sıra numarasını döndürür."""
+def _bump_state_seq() -> None:
+    """Durum sıra numarasını artırır (kilit tutmayan çağıranlar için)."""
     with _JOBS_LOCK:
-        return {jid: dict(job) for jid, job in JOBS.items()}, _state_seq
+        _bump_state_seq_locked()
 
 
-def _write_state_file(jobs: dict, seq: int) -> None:
+def _snapshot_state() -> tuple[dict, int]:
+    """Kalıcı durumun JSON'a yazılabilir kopyasını + sıra numarasını döndürür.
+
+    İki kilit ARDIŞIK alınır, iç içe DEĞİL (deadlock önlemi).
+    """
+    with _JOBS_LOCK:
+        jobs = {jid: dict(job) for jid, job in JOBS.items()}
+        seq = _state_seq
+    with _SERIES_LOCK:
+        series = {slug: dict(bilgi) for slug, bilgi in _SERIES.items()}
+    return {"version": 1, "jobs": jobs, "series": series}, seq
+
+
+def _write_state_file(payload: dict, seq: int) -> None:
     """jobs.json'ı atomik yazar (temp + os.replace). Eski snapshot'ı atlar."""
     global _state_written_seq
     with _STATE_LOCK:
         if seq < _state_written_seq:
             return  # daha yeni bir snapshot zaten yazılmış
-        payload = {"version": 1, "jobs": jobs}
         try:
             os.makedirs(_STATE_DIR, exist_ok=True)
             tmp = _STATE_FILE + ".tmp"
@@ -289,8 +307,8 @@ def _persist_jobs(force: bool = False) -> None:
         if not force and (now - _state_last_flush) < _STATE_FLUSH_SECS:
             return  # ara ilerleme güncellemesi — atlanabilir, kayıp önemsiz
         _state_last_flush = now
-    jobs, seq = _snapshot_jobs()
-    _write_state_file(jobs, seq)
+    payload, seq = _snapshot_state()
+    _write_state_file(payload, seq)
 
 
 def _load_state() -> int:
@@ -306,9 +324,15 @@ def _load_state() -> int:
         with open(_STATE_FILE, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
         saved = (payload or {}).get("jobs") or {}
+        saved_series = (payload or {}).get("series") or {}
     except Exception as exc:
         log.warning("İş durumu okunamadı (%s): %s", _STATE_FILE, exc)
         return 0
+
+    with _SERIES_LOCK:
+        for slug, bilgi in saved_series.items():
+            if isinstance(bilgi, dict):
+                _SERIES[slug] = bilgi
 
     kesilen = 0
     with _JOBS_LOCK:
@@ -574,11 +598,15 @@ def _resolve_bolumler(anime: Any, episodes: Union[int, str, list]) -> list:
 
 
 def _finalize_file(
-    jid: str, output_base: str, season_folder: str, bolum: Any, pos: int
+    jid: str, output_base: str, season_folder: str, bolum: Any, pos: int,
+    naming: str = "default", season_number: int = 1,
 ) -> None:
     """İndirme bitince dosyayı okunur alt klasöre TAŞIR + yeniden adlandırır.
 
-    Hedef: `<output_base>/<season_folder>/<season_folder> - <NNN>.<ext>`.
+    Hedef (naming'e göre):
+      - "default":  `<output_base>/<season_folder>/<season_folder> - <NNN>.<ext>`
+      - "jellyfin": `<output_base>/<season_folder>/<season_folder> - S01E04.<ext>`
+
     yt-dlp önce dosyayı `<output_base>/<anime_slug>/<bolum_slug>.<ext>` altına
     indirir; burada onu düzenli sezon klasörüne taşıyıp boşalan geçici
     `anime_slug` klasörünü temizleriz. Best-effort: hata olursa işi düşürmez.
@@ -593,7 +621,11 @@ def _finalize_file(
         season_dir = os.path.join(output_base, season_folder)
         os.makedirs(season_dir, exist_ok=True)
 
-        target = os.path.join(season_dir, f"{season_folder} - {num}{ext}")
+        if (naming or "default").lower() == "jellyfin":
+            ad = f"{season_folder} - S{int(season_number):02d}E{int(num):02d}{ext}"
+        else:
+            ad = f"{season_folder} - {num}{ext}"
+        target = os.path.join(season_dir, ad)
         # Çakışma olursa üzerine YAZMA; " (2)" gibi ek ver.
         if os.path.abspath(target) != os.path.abspath(current) and os.path.exists(target):
             stem, e = os.path.splitext(target)
@@ -703,15 +735,20 @@ def _scan_dirs(dirs: list[str]) -> list[tuple[str, str]]:
 def _file_belongs_to(stem: str, season_folder: str, num: str, bolum_slug: str) -> bool:
     """Uzantısız dosya adı bu bölüme mi ait?
 
-    İki adlandırma da tanınır:
-      - `_finalize_file` çıktısı:  "<season_folder> - NNN"  (ve " (2)" çakışma eki)
+    Üç adlandırma da tanınır:
+      - `naming="default"` çıktısı:  "<season_folder> - NNN"  (" (2)" çakışma eki)
+      - `naming="jellyfin"` çıktısı: "<season_folder> - S01E04"
       - ham/yeniden adlandırılmamış: "<bolum_slug>" (yt-dlp format eki alabilir:
         "<bolum_slug>.f137")
     """
     if bolum_slug and (stem == bolum_slug or stem.startswith(bolum_slug + ".")):
         return True
     prefix = f"{season_folder} - {num}"
-    return stem == prefix or stem.startswith(prefix + " (")
+    if stem == prefix or stem.startswith(prefix + " ("):
+        return True
+    m = re.match(rf"^{re.escape(season_folder)} - S\d+E(\d+)(?: \(\d+\))?$",
+                 stem, re.IGNORECASE)
+    return bool(m) and int(m.group(1)) == int(num)
 
 
 def _episode_status(files: list[tuple[str, str]], season_folder: str,
@@ -879,6 +916,8 @@ def _download_task(
     max_resolution: bool,
     rename: bool,
     resume: bool = True,
+    naming: str = "default",
+    season_number: int = 1,
 ) -> None:
     """Tek bir bölümü indiren arka plan işi (thread havuzunda çalışır)."""
     slot_held = False
@@ -1016,7 +1055,8 @@ def _download_task(
             if tamamlandi:
                 _job_set(jid, status="finished", error=None)
                 if rename:
-                    _finalize_file(jid, output_base, season_folder, bolum, pos)
+                    _finalize_file(jid, output_base, season_folder, bolum, pos,
+                                   naming, season_number)
                 log.info("[%s] tamamlandı (player=%s): %s", jid, player, bolum.slug)
                 return
 
@@ -1215,6 +1255,8 @@ def _start_downloads(
     max_workers: Optional[int] = None,
     resume: bool = True,
     skip_existing: bool = False,
+    naming: str = "default",
+    season_number: int = 1,
 ) -> dict:
     """İndirme işlerini kuran çekirdek mantık (araçlar bunu çağırır)."""
     # Eşzamanlı indirme sınırını bu çağrıya göre ayarla (None → varsayılan=1).
@@ -1282,12 +1324,15 @@ def _start_downloads(
                     "max_resolution": bool(max_resolution),
                     "rename": bool(rename),
                     "resume": bool(resume),
+                    "naming": naming,
+                    "season_number": int(season_number),
                 },
             }
         _EXECUTOR.submit(
             _download_task,
             jid, anime_slug, anime_title, bolum, pos,
             output_base, season_folder, fansub, max_resolution, rename, resume,
+            naming, season_number,
         )
         jobs_out.append({"job_id": jid, "anime": anime_title, "bolum": bolum.title})
 
@@ -1316,6 +1361,8 @@ def download_episodes(
     max_workers: Optional[int] = None,
     resume: bool = True,
     skip_existing: bool = False,
+    naming: str = "default",
+    season_number: int = 1,
 ) -> dict:
     """Bir animenin belirtilen bölümlerini ARKA PLANDA indir.
 
@@ -1353,6 +1400,11 @@ def download_episodes(
         skip_existing: True ise diskte EKSİKSİZ duran bölümler kuyruğa alınmaz
             (verify_library ile aynı kontrol). Yarım/eksik olanlar yine iner.
             "Sezonu tamamla/güncelle" akışı için idealdir.
+        naming: Dosya adlandırma düzeni. "default" → "<Başlık> - 004.mp4".
+            "jellyfin" → "<Başlık> - S01E04.mp4" (Jellyfin/Plex/Emby uyumlu).
+            Yalnızca rename=True iken etkilidir.
+        season_number: naming="jellyfin" için sezon numarası (varsayılan 1).
+            TürkAnime'de her sezon ayrı slug olduğundan elle verilir.
 
     Returns:
         {"output_dir", "target_dir", "queued", "parallel", "resume",
@@ -1362,6 +1414,7 @@ def download_episodes(
         return _start_downloads(
             anime_slug, episodes, output_dir, subfolder,
             fansub, max_resolution, rename, max_workers, resume, skip_existing,
+            naming, season_number,
         )
     except Exception as exc:
         log.exception("download_episodes hatası")
@@ -1379,6 +1432,8 @@ def download_season(
     max_workers: Optional[int] = None,
     resume: bool = True,
     skip_existing: bool = False,
+    naming: str = "default",
+    season_number: int = 1,
 ) -> dict:
     """Bir animenin (sezonun) TÜM bölümlerini ARKA PLANDA, asenkron indir.
 
@@ -1401,6 +1456,9 @@ def download_season(
         skip_existing: True ise diskte eksiksiz duran bölümler atlanır — yani
             "sezonu tamamla/güncelle" tek komutta olur. Dönüşteki `skipped`
             atlanan bölüm numaralarını verir.
+        naming: "default" → "<Başlık> - 004.mp4"; "jellyfin" →
+            "<Başlık> - S01E04.mp4" (Jellyfin/Plex/Emby uyumlu).
+        season_number: naming="jellyfin" için sezon numarası (varsayılan 1).
 
     Returns:
         {"output_dir", "target_dir", "queued", "parallel", "resume",
@@ -1410,6 +1468,7 @@ def download_season(
         return _start_downloads(
             anime_slug, "all", output_dir, subfolder,
             fansub, max_resolution, rename, max_workers, resume, skip_existing,
+            naming, season_number,
         )
     except Exception as exc:
         log.exception("download_season hatası")
@@ -1576,6 +1635,9 @@ def retry_job(job_id: str) -> dict:
             bool(params.get("rename", True)),
             None,                            # paralel limiti değiştirme
             bool(params.get("resume", True)),
+            False,                           # skip_existing: yeniden denemenin amacı bu
+            params.get("naming", "default"),
+            int(params.get("season_number", 1)),
         )
         if yeni.get("error"):
             return yeni
@@ -1781,6 +1843,195 @@ def verify_library(
     except Exception as exc:
         log.exception("verify_library hatası")
         return {"error": f"Kütüphane doğrulanamadı: {exc}"}
+
+
+@mcp.tool()
+def health_check() -> dict:
+    """Sunucunun sağlığını/teşhisini raporla (indirme sorunlarında ilk bakılacak yer).
+
+    Kontroller: turkanime_api import edilebiliyor mu, TürkAnime'ye ulaşılıyor mu
+    (Cloudflare bypass dahil), ffmpeg PATH'te mi, indirme klasörü tanımlı ve
+    yazılabilir mi, CA bundle ASCII bir yolda mı, durum klasörü yazılabilir mi.
+
+    Returns:
+        {"overall": "ok"|"uyarı"|"hata", "checks": [{"name", "status", "detail"}, ...]}
+    """
+    checks: list[dict] = []
+
+    def ekle(name: str, status: str, detail: str) -> None:
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    # 1) turkanime_api
+    try:
+        _get_ta()
+        ekle("turkanime_api", "ok", "Paket import edildi.")
+        ta_ok = True
+    except Exception as exc:
+        ekle("turkanime_api", "hata", f"{exc}")
+        ta_ok = False
+
+    # 2) TürkAnime erişimi — upstream'in kendi session kurulumunu kullanır;
+    #    böylece SSL/CA ve Cloudflare bypass da gerçekten sınanmış olur.
+    if ta_ok:
+        try:
+            from turkanime_api import bypass
+            bypass.fetch(None)
+            ekle("turkanime.tv", "ok", f"Erişilebilir ({bypass.BASE_URL}).")
+        except Exception as exc:
+            ekle("turkanime.tv", "hata",
+                 f"Ulaşılamadı: {exc}. Arama AnimeDepo'ya düşebilir.")
+    else:
+        ekle("turkanime.tv", "hata", "turkanime_api yok; kontrol edilemedi.")
+
+    # 3) ffmpeg
+    ff = shutil.which("ffmpeg")
+    if ff:
+        ekle("ffmpeg", "ok", ff)
+    else:
+        ekle("ffmpeg", "uyarı",
+             "PATH'te yok — ayrı video/ses parçalarının birleştirilmesi "
+             "başarısız olabilir. Kurulum: winget install Gyan.FFmpeg")
+
+    # 4) İndirme klasörü
+    try:
+        base = _resolve_base_dir(None)
+        os.makedirs(base, exist_ok=True)
+        deneme = os.path.join(base, f".turkanime-mcp-write-test-{uuid4().hex}")
+        with open(deneme, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(deneme)
+        ekle("output_dir", "ok", f"{base} (yazılabilir)")
+    except ValueError as exc:  # tanımlı değil
+        ekle("output_dir", "uyarı", str(exc))
+    except Exception as exc:
+        ekle("output_dir", "hata", f"Yazılamıyor: {exc}")
+
+    # 5) CA bundle — ASCII-dışı kullanıcı adlarında libcurl cacert.pem'i açamaz.
+    ca = os.environ.get("CURL_CA_BUNDLE", "")
+    if not ca:
+        ekle("ca_bundle", "uyarı", "CURL_CA_BUNDLE tanımlı değil.")
+    elif not os.path.exists(ca):
+        ekle("ca_bundle", "hata", f"Dosya yok: {ca}")
+    elif not ca.isascii():
+        ekle("ca_bundle", "hata",
+             f"Yol ASCII değil ({ca}) — libcurl açamaz, SSL hatası (curl 77) verir.")
+    else:
+        ekle("ca_bundle", "ok", ca)
+
+    # 6) Durum klasörü
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        deneme = os.path.join(_STATE_DIR, f".write-test-{uuid4().hex}")
+        with open(deneme, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(deneme)
+        ekle("state_dir", "ok", f"{_STATE_DIR} (yazılabilir)")
+    except Exception as exc:
+        ekle("state_dir", "uyarı", f"Yazılamıyor: {exc} — iş geçmişi kalıcı olmaz.")
+
+    durumlar = {c["status"] for c in checks}
+    overall = "hata" if "hata" in durumlar else ("uyarı" if "uyarı" in durumlar else "ok")
+    return {"overall": overall, "checks": checks}
+
+
+def _series_get(slug: str) -> dict:
+    with _SERIES_LOCK:
+        return dict(_SERIES.get(slug) or {})
+
+
+def _series_set(slug: str, **fields: Any) -> None:
+    with _SERIES_LOCK:
+        _SERIES.setdefault(slug, {}).update(fields)
+    _bump_state_seq()
+    _persist_jobs(force=True)
+
+
+@mcp.tool()
+def check_new_episodes(
+    anime_slug: str,
+    auto_download: bool = False,
+    output_dir: Optional[str] = None,
+    subfolder: Optional[str] = None,
+    fansub: Optional[str] = None,
+    max_resolution: bool = True,
+    max_workers: Optional[int] = None,
+) -> dict:
+    """Bir animede yeni bölüm yayınlanmış mı diye bak (ve istersen hemen indir).
+
+    Taze bölüm listesini çeker (önbelleği atlar) ve kalıcı durumdaki "en son
+    bilinen bölüm sayısı" ile karşılaştırır. Zamanlanmış bir göreve bağlayarak
+    simulcast'ları otomatikleştirebilirsin.
+
+    İLK çağrıda karşılaştırılacak bir kayıt olmadığından yeni bölüm bildirilmez;
+    yalnızca mevcut sayı temel (baseline) olarak kaydedilir — aksi halde tüm
+    sezon "yeni" sanılırdı.
+
+    Args:
+        anime_slug: Anime slug'ı.
+        auto_download: True ise yeni bölümleri hemen kuyruğa alır.
+        output_dir: Kök klasör (auto_download için). Verilmezse TURKANIME_OUTPUT_DIR.
+        subfolder: Sezon alt klasörü (verilmezse başlıktan türetilir).
+        fansub: Tercih edilen fansub (auto_download için).
+        max_resolution: En yüksek çözünürlüğü tercih et (auto_download için).
+        max_workers: Paralel iş sayısı (auto_download için).
+
+    Returns:
+        {"anime", "episode_count", "previous_count", "first_check",
+         "new_episodes": [{"index", "episode", "slug", "title"}, ...],
+         "downloaded": bool, "queued_job_ids": [...]}
+    """
+    try:
+        anime = _get_anime(anime_slug, refresh=True)
+        anime_title = getattr(anime, "title", anime_slug)
+        bolumler = list(anime.bolumler)
+        toplam = len(bolumler)
+
+        onceki_kayit = _series_get(anime_slug)
+        onceki = onceki_kayit.get("episode_count")
+        ilk_kontrol = onceki is None
+
+        yeni_indexler: list[int] = []
+        if not ilk_kontrol and toplam > int(onceki):
+            yeni_indexler = list(range(int(onceki), toplam))
+
+        yeni = [{"index": i,
+                 "episode": int(_episode_number(bolumler[i], i)),
+                 "slug": bolumler[i].slug,
+                 "title": bolumler[i].title}
+                for i in yeni_indexler]
+
+        _series_set(anime_slug, title=anime_title, episode_count=toplam,
+                    last_checked=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+        sonuc: dict[str, Any] = {
+            "anime": anime_title,
+            "episode_count": toplam,
+            "previous_count": onceki,
+            "first_check": ilk_kontrol,
+            "new_episodes": yeni,
+            "downloaded": False,
+            "queued_job_ids": [],
+        }
+        if ilk_kontrol:
+            sonuc["note"] = (f"İlk kontrol: {toplam} bölüm temel olarak kaydedildi. "
+                             "Yeni bölümler bundan sonraki çağrılarda bildirilecek.")
+            return sonuc
+        if not yeni:
+            sonuc["note"] = "Yeni bölüm yok."
+            return sonuc
+
+        if auto_download:
+            started = _start_downloads(
+                anime_slug, yeni_indexler, output_dir, subfolder,
+                fansub, max_resolution, True, max_workers,
+            )
+            sonuc["downloaded"] = True
+            sonuc["queued_job_ids"] = started.get("job_ids", [])
+            sonuc["target_dir"] = started.get("target_dir")
+        return sonuc
+    except Exception as exc:
+        log.exception("check_new_episodes hatası")
+        return {"error": f"Yeni bölüm kontrolü başarısız: {exc}"}
 
 
 def main() -> None:
