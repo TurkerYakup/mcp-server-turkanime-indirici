@@ -1214,6 +1214,7 @@ def _start_downloads(
     rename: bool,
     max_workers: Optional[int] = None,
     resume: bool = True,
+    skip_existing: bool = False,
 ) -> dict:
     """İndirme işlerini kuran çekirdek mantık (araçlar bunu çağırır)."""
     # Eşzamanlı indirme sınırını bu çağrıya göre ayarla (None → varsayılan=1).
@@ -1228,6 +1229,20 @@ def _start_downloads(
     # Sezon/anime için otomatik alt klasör (kullanıcı `subfolder` ile ezebilir).
     season_folder = _sanitize(subfolder or anime_title or anime_slug)
     season_dir = os.path.join(output_base, season_folder)
+
+    # skip_existing: verify_library ile AYNI bölüm-durum mantığı; diskte
+    # eksiksiz (`ok`) duran bölümleri kuyruğa hiç alma. partial/missing indirilir.
+    skipped: list[int] = []
+    if skip_existing:
+        durumlar = _library_states(anime, output_base, season_folder, secili)
+        kalan = []
+        for bolum, durum in zip(secili, durumlar):
+            if durum["status"] == "ok":
+                skipped.append(durum["episode"])
+            else:
+                kalan.append(bolum)
+        secili = kalan
+        skipped.sort()
 
     # `pos`, animenin TAM listesindeki 0-tabanlı index'tir (seçim içindeki sıra
     # değil). `_episode_number` slug'da rakam bulamazsa buna düşer; verify_library
@@ -1255,6 +1270,19 @@ def _start_downloads(
                 "file": None,
                 "error": None,
                 "cancel": False,
+                # retry_job'un işi ORİJİNAL parametreleriyle yeniden kuyruğa
+                # alabilmesi için (kalıcı duruma da yazılır — restart sonrası
+                # `interrupted` işler böylece yeniden denenebilir).
+                "params": {
+                    "anime_slug": anime_slug,
+                    "bolum_slug": bolum.slug,
+                    "output_dir": output_base,
+                    "subfolder": season_folder,
+                    "fansub": fansub,
+                    "max_resolution": bool(max_resolution),
+                    "rename": bool(rename),
+                    "resume": bool(resume),
+                },
             }
         _EXECUTOR.submit(
             _download_task,
@@ -1270,6 +1298,7 @@ def _start_downloads(
         "queued": len(jobs_out),
         "parallel": parallel,
         "resume": bool(resume),
+        "skipped": skipped,
         "jobs": jobs_out,
         "job_ids": [j["job_id"] for j in jobs_out],
     }
@@ -1286,6 +1315,7 @@ def download_episodes(
     rename: bool = True,
     max_workers: Optional[int] = None,
     resume: bool = True,
+    skip_existing: bool = False,
 ) -> dict:
     """Bir animenin belirtilen bölümlerini ARKA PLANDA indir.
 
@@ -1320,15 +1350,18 @@ def download_episodes(
         resume: True (varsayılan) ise bir kaynak akışı yarıda keserse aynı
             kaynakta kaldığı yerden devam etmeye çalışır; ilerleme olmazsa yarım
             dosyayı silip farklı bir kaynağa geçer. False = her seferinde baştan.
+        skip_existing: True ise diskte EKSİKSİZ duran bölümler kuyruğa alınmaz
+            (verify_library ile aynı kontrol). Yarım/eksik olanlar yine iner.
+            "Sezonu tamamla/güncelle" akışı için idealdir.
 
     Returns:
         {"output_dir", "target_dir", "queued", "parallel", "resume",
-         "jobs":[...], "job_ids":[...]}
+         "skipped":[...], "jobs":[...], "job_ids":[...]}
     """
     try:
         return _start_downloads(
             anime_slug, episodes, output_dir, subfolder,
-            fansub, max_resolution, rename, max_workers, resume,
+            fansub, max_resolution, rename, max_workers, resume, skip_existing,
         )
     except Exception as exc:
         log.exception("download_episodes hatası")
@@ -1345,6 +1378,7 @@ def download_season(
     rename: bool = True,
     max_workers: Optional[int] = None,
     resume: bool = True,
+    skip_existing: bool = False,
 ) -> dict:
     """Bir animenin (sezonun) TÜM bölümlerini ARKA PLANDA, asenkron indir.
 
@@ -1364,15 +1398,18 @@ def download_season(
             1 (tek tek). Örn. 3 → 3 bölüm aynı anda.
         resume: True (varsayılan) ise yarıda kesilen indirmeyi aynı kaynakta
             kaldığı yerden devam ettirmeye çalışır (bkz. download_episodes).
+        skip_existing: True ise diskte eksiksiz duran bölümler atlanır — yani
+            "sezonu tamamla/güncelle" tek komutta olur. Dönüşteki `skipped`
+            atlanan bölüm numaralarını verir.
 
     Returns:
         {"output_dir", "target_dir", "queued", "parallel", "resume",
-         "jobs":[...], "job_ids":[...]}
+         "skipped":[...], "jobs":[...], "job_ids":[...]}
     """
     try:
         return _start_downloads(
             anime_slug, "all", output_dir, subfolder,
-            fansub, max_resolution, rename, max_workers, resume,
+            fansub, max_resolution, rename, max_workers, resume, skip_existing,
         )
     except Exception as exc:
         log.exception("download_season hatası")
@@ -1419,6 +1456,143 @@ def download_status(job_id: Optional[str] = None,
     except Exception as exc:
         log.exception("download_status hatası")
         return {"error": f"Durum alınamadı: {exc}"}
+
+
+def _parse_percent(job: dict) -> Optional[float]:
+    """İşin ilerlemesini 0..100 arası sayıya çevirir (bilinmiyorsa None)."""
+    status = job.get("status")
+    if status == "finished":
+        return 100.0
+    if status == "queued":
+        return 0.0
+    ham = (job.get("percent") or "").strip().rstrip("%").strip()
+    try:
+        return max(0.0, min(100.0, float(ham)))
+    except (TypeError, ValueError):
+        return None
+
+
+@mcp.tool()
+def get_batch_summary(job_ids: Optional[list[str]] = None) -> dict:
+    """Çok sayıda indirmenin TOPLU özetini ver (tek tek pollamadan).
+
+    Args:
+        job_ids: Özetlenecek iş id'leri. None ise TÜM işler özetlenir.
+
+    Returns:
+        {"total", "finished", "downloading", "queued", "error", "cancelled",
+         "interrupted", "average_percent", "eta_seconds",
+         "errors": [{"job_id", "bolum", "error"}, ...], "job_ids_unknown": [...]}
+
+        `average_percent`: ilerlemesi bilinen işlerin ortalaması (biten=100).
+        `eta_seconds`: şu an İNEN işler arasındaki en büyük ETA. Kuyrukta
+            bekleyenler DAHİL DEĞİLDİR — kaynak hızları ve paralel limit
+            değişken olduğundan toplam süre dürüstçe kestirilemez.
+    """
+    try:
+        with _JOBS_LOCK:
+            if job_ids is None:
+                secili = [dict(j) for j in JOBS.values()]
+                bilinmeyen: list[str] = []
+            else:
+                secili = [dict(JOBS[j]) for j in job_ids if j in JOBS]
+                bilinmeyen = [j for j in job_ids if j not in JOBS]
+
+        sayac = {"finished": 0, "downloading": 0, "queued": 0, "error": 0,
+                 "cancelled": 0, "interrupted": 0, "kaynak_araniyor": 0}
+        yuzdeler: list[float] = []
+        etalar: list[int] = []
+        hatalar: list[dict] = []
+        for job in secili:
+            status = job.get("status") or "queued"
+            if status in sayac:
+                sayac[status] += 1
+            pct = _parse_percent(job)
+            if pct is not None:
+                yuzdeler.append(pct)
+            if status == "downloading":
+                eta = job.get("eta")
+                if isinstance(eta, (int, float)) and eta >= 0:
+                    etalar.append(int(eta))
+            if status == "error":
+                hatalar.append({"job_id": job.get("job_id"),
+                                "bolum": job.get("bolum"),
+                                "error": job.get("error")})
+
+        return {
+            "total": len(secili),
+            "finished": sayac["finished"],
+            "downloading": sayac["downloading"] + sayac["kaynak_araniyor"],
+            "queued": sayac["queued"],
+            "error": sayac["error"],
+            "cancelled": sayac["cancelled"],
+            "interrupted": sayac["interrupted"],
+            "average_percent": (round(sum(yuzdeler) / len(yuzdeler), 1)
+                                if yuzdeler else None),
+            "eta_seconds": max(etalar) if etalar else None,
+            "errors": hatalar,
+            "job_ids_unknown": bilinmeyen,
+        }
+    except Exception as exc:
+        log.exception("get_batch_summary hatası")
+        return {"error": f"Özet alınamadı: {exc}"}
+
+
+@mcp.tool()
+def retry_job(job_id: str) -> dict:
+    """Hata almış ya da yarıda kesilmiş bir işi orijinal parametreleriyle yeniden dene.
+
+    Yeni bir iş oluşturulur; eski iş `retried_as` alanıyla yenisine işaret eder.
+    Biten (`finished`), iptal edilen ya da hâlâ süren işlerde bir şey yapılmaz.
+
+    Args:
+        job_id: Yeniden denenecek işin id'si (status: error veya interrupted).
+
+    Returns:
+        {"job_id": <yeni>, "retry_of": <eski>, "anime", "bolum", "status"}
+    """
+    try:
+        with _JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is None:
+                return {"error": f"İş bulunamadı: {job_id}"}
+            status = job.get("status")
+            params = dict(job.get("params") or {})
+        if status not in ("error", "interrupted"):
+            return {"job_id": job_id, "status": status,
+                    "message": "Yalnızca 'error' veya 'interrupted' işler yeniden "
+                               f"denenebilir; bu iş '{status}'."}
+        if not params.get("anime_slug") or not params.get("bolum_slug"):
+            return {"error": "İşin orijinal parametreleri yok (muhtemelen bu "
+                             "özellikten önce oluşturulmuş); indirmeyi elle başlatın."}
+
+        yeni = _start_downloads(
+            params["anime_slug"],
+            params["bolum_slug"],           # slug ile tek bölüm
+            params.get("output_dir"),
+            params.get("subfolder"),
+            params.get("fansub"),
+            bool(params.get("max_resolution", True)),
+            bool(params.get("rename", True)),
+            None,                            # paralel limiti değiştirme
+            bool(params.get("resume", True)),
+        )
+        if yeni.get("error"):
+            return yeni
+        yeni_ids = yeni.get("job_ids") or []
+        if not yeni_ids:
+            return {"error": "Yeniden kuyruğa alınamadı: bölüm çözülemedi."}
+        _job_set(job_id, retried_as=yeni_ids[0])
+        return {
+            "job_id": yeni_ids[0],
+            "retry_of": job_id,
+            "anime": (yeni.get("jobs") or [{}])[0].get("anime"),
+            "bolum": (yeni.get("jobs") or [{}])[0].get("bolum"),
+            "status": "queued",
+        }
+    except Exception as exc:
+        log.exception("retry_job hatası")
+        return {"error": f"Yeniden denenemedi: {exc}"}
 
 
 @mcp.tool()
