@@ -1,33 +1,40 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "turkanime-mcp"
-version = "0.1.0"
-description = "TürkAnime İndirici için stdio tabanlı MCP sunucusu (turkanime-cli sarmalayıcısı)"
+version = "1.0.0"
+description = "TürkAnime İndirici — Claude Desktop MCP Sunucusu"
+authors = [{ name = "Türker Yakup" }]
+license = { text = "CC-BY-NC-ND-4.0" }
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "CC-BY-NC-ND-4.0" }
-authors = [{ name = "TurkerYakup" }]
-keywords = ["mcp", "turkanime", "anime", "yt-dlp", "claude"]
+keywords = ["mcp", "turkanime", "anime", "downloader", "claude"]
 
 dependencies = [
-    "mcp>=1.2.0",
+    # MCP Framework (FastMCP wraps official SDK)
+    "fastmcp>=3.0.0",
+    
+    # TürkAnime Core (includes yt-dlp, curl-cffi, pycryptodome)
     "turkanime-cli>=10.0.3",
-    # ffmpeg yedeği: PATH'te sistem ffmpeg'i yoksa birleştirme bununla yapılır
-    # (kurulum sırasında otomatik gelir; winget/yönetici izni gerekmez).
+    
+    # FFmpeg Fallback (auto-bundled; system ffmpeg preferred via PATH)
     "imageio-ffmpeg>=0.4.9",
+    
+    # Windows stdio support (mcp SDK requirement)
     "pywin32>=306 ; sys_platform == 'win32'",
 ]
 
-[project.urls]
-Homepage = "https://github.com/TurkerYakup/mcp-server-turkanime-indirici"
-Upstream = "https://github.com/KebabLord/turkanime-indirici"
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
 
-[project.scripts]
-# Kurulunca: `turkanime-mcp` komutu doğrudan sunucuyu başlatır.
-turkanime-mcp = "turkanime_mcp:main"
+[project.urls]
+Repository = "https://github.com/TurkerYakup/mcp-server-turkanime-indirici"
+Documentation = "https://github.com/TurkerYakup/mcp-server-turkanime-indirici/blob/main/README.md"
 
 [tool.setuptools]
 py-modules = ["turkanime_mcp"]
