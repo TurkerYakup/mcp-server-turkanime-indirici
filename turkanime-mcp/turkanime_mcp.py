@@ -103,7 +103,7 @@ def _ensure_ca_bundle() -> None:
 _ensure_ca_bundle()
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server import FastMCP
 except Exception as exc:  # pragma: no cover
     log.error("MCP SDK import edilemedi: %s", exc)
     log.error("Kurulum: pip install -r requirements.txt "
