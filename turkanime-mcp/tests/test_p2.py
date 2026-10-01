@@ -202,7 +202,7 @@ class HealthCheckTest(unittest.TestCase):
         r = _fn(tm.health_check)()
         d = self._isim_status(r)
         self.assertEqual(d["turkanime_api"], "hata")
-        self.assertEqual(d["turkanime.tv"], "hata")
+        self.assertEqual(d["kaynak"], "hata")
         self.assertEqual(r["overall"], "hata")
 
     def test_output_dir_yazilabilir(self):
@@ -215,7 +215,7 @@ class HealthCheckTest(unittest.TestCase):
         r = _fn(tm.health_check)()
         self.assertEqual(
             set(self._isim_status(r)),
-            {"turkanime_api", "turkanime.tv", "ffmpeg", "output_dir",
+            {"turkanime_api", "kaynak", "ffmpeg", "output_dir",
              "ca_bundle", "state_dir"})
         self.assertIn(r["overall"], ("ok", "uyarı", "hata"))
 

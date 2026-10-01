@@ -195,6 +195,46 @@ class ProviderAllowedTest(unittest.TestCase):
         self.assertTrue(tm._provider_allowed("bilinmeyen"))
 
 
+class EpisodeProviderTest(unittest.TestCase):
+    """Bölüm verisi, aramayla aynı sağlayıcıdan gelmeli."""
+
+    def setUp(self):
+        tm._MANIFEST_CACHE = copy.deepcopy(_MANIFEST)
+        self.addCleanup(setattr, tm, "_MANIFEST_CACHE", None)
+        self.addCleanup(setattr, tm, "_client_version", tm._client_version)
+        tm._client_version = lambda: (10, 0, 4)
+        eski = os.environ.pop("TURKANIME_PROVIDER", None)
+        if eski is not None:
+            self.addCleanup(os.environ.__setitem__, "TURKANIME_PROVIDER", eski)
+        else:
+            self.addCleanup(os.environ.pop, "TURKANIME_PROVIDER", None)
+
+    def test_varsayilan_turkanime(self):
+        self.assertEqual(tm._episode_provider_name(), "turkanime")
+
+    def test_force_fallback_animedepo(self):
+        tm._MANIFEST_CACHE["features"]["search"]["force_fallback"] = True
+        self.assertEqual(tm._episode_provider_name(), "animedepo")
+
+    def test_turkanime_kapaliysa_animedepo(self):
+        tm._MANIFEST_CACHE["providers"]["turkanime"]["enabled"] = False
+        self.assertEqual(tm._episode_provider_name(), "animedepo")
+
+    def test_env_manifesti_ezer(self):
+        tm._MANIFEST_CACHE["features"]["search"]["force_fallback"] = True
+        os.environ["TURKANIME_PROVIDER"] = "turkanime"
+        self.assertEqual(tm._episode_provider_name(), "turkanime")
+
+    def test_animedepo_modulu_ve_base_url(self):
+        tm._MANIFEST_CACHE["features"]["search"]["force_fallback"] = True
+        tm._MANIFEST_CACHE["animedepo_url"] = "https://ornek.invalid/depo"
+        from turkanime_api import animedepo
+        self.addCleanup(setattr, animedepo, "BASE_URL", animedepo.BASE_URL)
+        mod = tm._episode_provider()
+        self.assertIs(mod, animedepo)
+        self.assertEqual(animedepo.BASE_URL, "https://ornek.invalid/depo")
+
+
 class ManifestTest(unittest.TestCase):
     def test_depodaki_manifest_okunur(self):
         """Depodaki gerçek manifest.json bulunmalı ve fallback tanımlı olmalı."""

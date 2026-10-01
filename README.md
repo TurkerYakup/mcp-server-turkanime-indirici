@@ -16,6 +16,13 @@ indirir ve düzenli klasörler.
 
 ---
 
+> [!WARNING]
+> **TürkAnime 19.09.2026'da kapandı.** Sunucu artık upstream'in "B planı" olan **AnimeDepo
+> metadata arşivini** kullanıyor (`manifest.json` → `force_fallback: true`). Arama, bölüm listesi ve
+> indirme çalışmaya devam eder; ancak yalnızca **Eylül 2026 öncesi** yüklenmiş bölümlere erişilir,
+> yeni bölüm gelmez (`check_new_episodes` yeni bir şey bulmaz) ve 3. parti sitelerden silinen
+> videolar zamanla kaybolabilir.
+
 ## Ne yapar?
 
 Bu sunucu, TürkAnime'nin Python API'sini (`turkanime_api`) Claude Desktop'a **14 araç**
@@ -289,6 +296,7 @@ Kaydedip Claude Desktop'ı **tamamen kapatıp yeniden açın** (tepsiden Quit). 
 | `TURKANIME_SEARCH_RETRIES` | `2` | `search_anime` deneme sayısı (boş sonuç da yeniden denenir) |
 | `TURKANIME_SEARCH_BACKOFF` | `0.5` | Arama denemeleri arası bekleme temeli (saniye): 0.5s, 1.0s, … |
 | `TURKANIME_MANIFEST` | *(otomatik)* | `manifest.json` yolu; verilmezse depodaki kopya okunur |
+| `TURKANIME_PROVIDER` | *(manifest)* | Bölüm/video kaynağı: `animedepo` veya `turkanime`. Verilmezse manifest belirler (şu an `animedepo`) |
 | `TURKANIME_FFMPEG` | *(otomatik)* | `ffmpeg` ikilisinin tam yolu; verilmezse PATH → `imageio-ffmpeg` sırasıyla aranır |
 | `CURL_CA_BUNDLE` | *(otomatik)* | ASCII CA sertifika yolu (sunucu gerekirse kendi ayarlar) |
 
