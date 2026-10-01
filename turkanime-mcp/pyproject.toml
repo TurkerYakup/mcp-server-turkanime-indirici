@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turkanime-mcp"
-version = "1.1.0"
+version = "1.0.0"
 description = "TürkAnime İndirici — Claude Desktop MCP Sunucusu"
 authors = [{ name = "Türker Yakup" }]
 license = { text = "CC-BY-NC-ND-4.0" }
