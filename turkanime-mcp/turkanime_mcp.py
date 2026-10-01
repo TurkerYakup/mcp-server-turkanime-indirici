@@ -472,6 +472,34 @@ def _search_feature() -> dict:
     return (_manifest().get("features") or {}).get("search") or {}
 
 
+def _episode_provider_name() -> str:
+    """Bölüm/video verisinin hangi sağlayıcıdan geleceği.
+
+    Öncelik: TURKANIME_PROVIDER env > manifest. Manifest'te TürkAnime kapalıysa
+    ya da arama force_fallback ile AnimeDepo'ya zorlanmışsa bölümler de
+    AnimeDepo'dan gelir; aksi halde arama sonucundaki slug ile bölüm listesi
+    farklı kaynaklardan gelirdi. (TürkAnime 19.09.2026'da kapandı; upstream
+    manifest'i force_fallback=true yaptı.)
+    """
+    env = os.environ.get("TURKANIME_PROVIDER", "").strip().lower()
+    if env in ("turkanime", "animedepo"):
+        return env
+    if not _provider_allowed("turkanime") or _search_feature().get("force_fallback"):
+        return "animedepo"
+    return "turkanime"
+
+
+def _episode_provider():
+    """Seçili sağlayıcının Anime sınıfını barındıran modülü döndürür."""
+    if _episode_provider_name() == "animedepo":
+        from turkanime_api import animedepo
+        mf = _manifest()
+        if mf.get("animedepo_url"):
+            animedepo.BASE_URL = mf["animedepo_url"]
+        return animedepo
+    return _get_ta()
+
+
 # --------------------------------------------------------------------------- #
 # ffmpeg çözümü: ayrı video/ses parçalarını birleştirmek için gerekir.
 # --------------------------------------------------------------------------- #
@@ -585,8 +613,7 @@ def _get_anime(slug: str, refresh: bool = False):
         with _ANIME_LOCK:
             if slug in _ANIME_CACHE:
                 return _ANIME_CACHE[slug]
-    ta = _get_ta()
-    anime = ta.Anime(slug)
+    anime = _episode_provider().Anime(slug)
     anime.fetch_info()  # info + anime_id doldurur; bölüm listesi için ŞART
     with _ANIME_LOCK:
         _ANIME_CACHE[slug] = anime
@@ -2013,18 +2040,26 @@ def health_check() -> dict:
         ekle("turkanime_api", "hata", f"{exc}")
         ta_ok = False
 
-    # 2) TürkAnime erişimi — upstream'in kendi session kurulumunu kullanır;
-    #    böylece SSL/CA ve Cloudflare bypass da gerçekten sınanmış olur.
-    if ta_ok:
+    # 2) Kaynak erişimi: AnimeDepo arşivi ya da TürkAnime (upstream session ile;
+    #    böylece SSL/CA ve Cloudflare bypass da gerçekten sınanmış olur).
+    if not ta_ok:
+        ekle("kaynak", "hata", "turkanime_api yok; kontrol edilemedi.")
+    elif _episode_provider_name() == "animedepo":
+        try:
+            dep = _episode_provider()
+            dep.dizin()
+            ekle("kaynak", "ok", f"AnimeDepo erişilebilir ({dep.BASE_URL}). "
+                 "TürkAnime kapandı; yalnızca Eylül 2026 öncesi arşiv mevcut.")
+        except Exception as exc:
+            ekle("kaynak", "hata", f"AnimeDepo ulaşılamadı: {exc}")
+    else:
         try:
             from turkanime_api import bypass
             bypass.fetch(None)
-            ekle("turkanime.tv", "ok", f"Erişilebilir ({bypass.BASE_URL}).")
+            ekle("kaynak", "ok", f"TürkAnime erişilebilir ({bypass.BASE_URL}).")
         except Exception as exc:
-            ekle("turkanime.tv", "hata",
+            ekle("kaynak", "hata",
                  f"Ulaşılamadı: {exc}. Arama AnimeDepo'ya düşebilir.")
-    else:
-        ekle("turkanime.tv", "hata", "turkanime_api yok; kontrol edilemedi.")
 
     # 3) ffmpeg
     ff_yol, ff_kaynak = _resolve_ffmpeg()
